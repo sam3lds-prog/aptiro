@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local SQLite dev DB
+*.db
+*.sqlite3
+aptiro.db
+
+# Environment (keep .env.example tracked, never commit real .env)
+.env
+.env.local
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Build
+build/
+dist/

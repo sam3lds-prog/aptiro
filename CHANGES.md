@@ -1,0 +1,202 @@
+# CHANGES — Phase 2: Real job discovery & explainable matching
+
+Phase 2 is **additive and behavior-preserving**. Every Phase 1 +
+Delivery 1–4 invariant is untouched: the test suite stays green and
+grew **63 → 83** (20 new tests, 0 removed, 0 changed). Single-file
+`app.py` shape preserved; the one new module is a top-level sibling
+(`embeddings.py`) following the proven `ai_provider.py` pattern. All
+non-negotiables hold — no crawling, no LinkedIn/auth-walled scraping, no
+CAPTCHA bypass, no fabricated claims, and the deterministic 0–100 score
+remains the single source of truth for ranking.
+
+## Added
+
+- **`backend/embeddings.py`** (new sibling module). Pluggable embedding
+  provider, deterministic **mock by default** (hashed bag-of-tokens →
+  fixed unit vector; identical input → identical vector). A real model
+  (`openai`) is used only behind `APTIRO_EMBEDDING_PROVIDER=openai` +
+  key + SDK, with automatic fallback to mock. Same contract as the AI
+  provider: the app and tests need no key and no network.
+- **Structured requirement extraction** (`_structured_requirements`).
+  Splits a JD into `must_have` / `nice_to_have` (section headers +
+  inline “a plus / preferred” cues), plus `min_years`,
+  `seniority_rank`, `skills`, `domains`. Reuses the existing
+  deterministic parser primitives (`_REQ_LINE`, `_extract_skills`,
+  `_seniority_rank`, `_domains_in`) so behaviour is consistent with the
+  rest of the pipeline. The flat `requirements` list is still produced
+  and stored unchanged.
+- **User-supplied URL import** (`fetch_url_text` +
+  `POST /api/jobs/import-url`). Server-side fetch of the **one** URL the
+  user pastes — not a crawler. Guardrails: http/https only, denylist of
+  login/auth-walled hosts (LinkedIn, Indeed, Glassdoor, …), robots.txt
+  honoured (fail-closed on an explicit `Disallow`), timeout + response
+  size cap (both env-tunable), HTML/text content-type only, scripts and
+  styles stripped, reduced to text, fed through the same `import_job`
+  normaliser. Failures map to a clear HTTP 422.
+- **Dedupe + archival**. New jobs are de-duplicated on normalised
+  (company, title, source_url): a duplicate paste/URL returns the
+  existing job with HTTP 200 and `deduplicated: true` instead of a copy.
+  `POST /api/jobs/{id}/archive` and `/unarchive` toggle visibility;
+  archived jobs already drop out of `/api/jobs` and `/api/matches`.
+- **Explainable evidence**. `_candidate_profile` now records which
+  approved claim earned which signal (skills, domains, AI terms,
+  leadership, seniority, overall evidence). Every `ScoreComponent` in a
+  match now carries an `evidence` list of `{claim_id, snippet}` so each
+  point traces back to the exact approved claim that earned it.
+- **Secondary semantic signal**. Each match carries a `semantic` block
+  (provider, cosine similarity, `affects_score: false`, an `agreement`
+  hint and an explicit note). It is computed from the embedding
+  provider (mock by default → deterministic) and is **never** mixed into
+  the 0–100 score or the ranking — tests assert ranking is by the
+  deterministic score alone.
+- **Safe additive schema self-heal** (`_ensure_additive_columns`) +
+  Alembic `0002_phase2_job_structured_requirements`. `create_all()`
+  never ALTERs an existing table, so a pre-Phase-2 DB would be missing
+  the new column. The self-heal applies only additive `ADD COLUMN`s for
+  columns already on the model (no drops, no type changes, no data
+  loss); Postgres production still migrates via Alembic. This fixes the
+  upgrade path for any DB created before Phase 2.
+- **Tests (`test_app.py`, +20)**: requirement must/nice split &
+  attribution; URL fetch over a mocked transport (success, bad scheme,
+  LinkedIn denied, robots `Disallow`, non-HTML, oversized, timeout) and
+  the endpoint’s 422 mapping; dedupe and archive/unarchive; score
+  components sum to `earned_points` and cite real claim evidence;
+  semantic signal deterministic offline and never reorders ranking; the
+  additive self-heal preserves existing rows; Phase-2 health.
+
+## Changed in `app.py` (surgical, additive only)
+
+- `JobPosting` gains `structured_requirements: dict` (JSON, default
+  `{}`). The flat `requirements` list is unchanged.
+- `import_job(...)` gains a `source` argument (default
+  `"manual_import"`; URL import passes `"url_import"`) and now also
+  populates `structured_requirements`.
+- `JobRead` gains `structured_requirements`, `is_archived`,
+  `deduplicated`; `_job_read` fills them. `ScoreComponent` gains
+  `evidence`; `JobMatchOut` gains `structured_requirements` and
+  `semantic`. All new fields are optional/defaulted, so existing clients
+  and the existing tests are unaffected.
+- `score_job(...)`’s return dict gains `structured_requirements` and
+  `semantic`; every existing key is unchanged, so the council, package
+  builder and apply paths that consume `score_job` see no behavioural
+  difference.
+- `init_db()` now also runs the additive self-heal. `/api/health` adds
+  `phase`, the embedding provider, `job_import`, and `semantic_signal`
+  **without** changing `slice` (the field the health test pins).
+
+## Explicitly NOT changed (non-negotiables honored)
+
+- No crawling — exactly one user-supplied URL is fetched. No LinkedIn /
+  auth-walled scraping (host denylist). robots.txt respected. No CAPTCHA
+  or anti-bot circumvention.
+- The deterministic weighted 0–100 score is still the single source of
+  truth; the semantic signal is secondary and never affects score or
+  ranking.
+- No fabricated content; the embedding model is never on the trust path
+  and never produces grounded claims.
+- Provenance colours, the claim approval gate, bullet
+  accept/reject/rewrite/lock, the 13-step / 5-agent council, the Axiom
+  fabricated-metric block, and the export trust gate are all unchanged.
+
+## Validation
+
+`pytest -q` → **83 passed**. End-to-end with a real résumé
+(Pandoc-exported Markdown): paste import → structured must/nice +
+min_years 6 + seniority rank; identical re-import → HTTP 200,
+`deduplicated`, still one job; URL import → `source=url_import` with the
+source URL preserved; archive hides it from list/matches, unarchive
+restores; the match breakdown’s component `earned` values sum exactly to
+`earned_points`, 5 components cite 21 real claim snippets; the semantic
+signal is the deterministic mock, `affects_score=false`, and ranking is
+unchanged by it.
+
+---
+
+# CHANGES — Trust + Export slice (the diff, explained)
+
+This slice is **additive and behavior-preserving**. The Delivery 1–4
+contract (extraction & provenance, explainable scoring, package builder
++ per-bullet controls, 13-step / 5-agent council, apply scaffolding,
+privacy) is unchanged; the test suite stays green and grew from 54 → 63.
+
+> Honest framing: in this environment the prototype's source is not an
+> editable file, so this repo is a faithful, behavior-preserving rebuild
+> of the prototype **plus** the slice. The D1–D4 invariants are covered
+> by `test_app.py` (same guarantees), and the new ingestion/export/
+> exclusion behavior is covered on top.
+
+## Added (new files — the "limited modular split")
+
+- **`backend/ingestion.py`** — production PDF/DOCX/TXT/Markdown
+  extraction. Returns normalized, structure-preserving text + a
+  `parse_meta` blob (`format`, `pages`, `page_map`). Exotic bullet
+  glyphs are normalized; Pandoc/DOCX-export artifacts (`[x]{.underline}`,
+  nested `[[x]{.underline}](url)`, `{.attr}`, `\$ \( \)` escapes, hard
+  breaks, pure grid-table rule lines) are stripped so a real résumé
+  flows into the Vault cleanly. **It only changes how raw text is
+  produced** — the same `parse_document` / `extract_claims` pipeline
+  derives claims, so snippets, sections, provenance, confidence and the
+  approval gate are untouched.
+- **`backend/exporting.py`** — renders the export model to Markdown →
+  HTML → DOCX → PDF. Markdown/HTML are stdlib-only (always work); DOCX
+  (`python-docx`) and PDF (`reportlab`) raise a graceful
+  `ExportUnavailable` → HTTP 501 if the optional lib is absent, so the
+  app never hard-crashes.
+- **`backend/ai_provider.py`** — pluggable provider. **Mock is the
+  default** (deterministic, offline). Anthropic only behind
+  `APTIRO_AI_PROVIDER=anthropic` (+ key + SDK), with automatic fallback
+  to mock. AI is deliberately *not* on the trust path.
+- **`backend/test_app.py`** — D1–D4 invariants preserved + new tests:
+  ingestion (txt/md/pandoc-artifacts/docx-roundtrip/pdf-page-map/
+  unsupported/empty/size-limit/415), export (md/html/docx-valid-zip/
+  pdf-signature/400/404/preview/cover-letter-only/direct), and the
+  non-negotiable exclusion gate (rejected excluded, unsupported
+  excluded, explicit-override re-includes).
+- **Infra**: `requirements.txt`, `alembic.ini` + `alembic/` (env binds
+  SQLModel metadata, resolves `APTIRO_DATABASE_URL`; `0001_initial`
+  enables pgvector + builds the schema from live metadata),
+  `docker-compose.yml` (pgvector/pg16 + backend + static UI),
+  `Dockerfile.backend` (migrate then serve), `.env.example`, `RUN.sh`,
+  `README.md`, `frontend/index.html`.
+
+## Changed in `backend/app.py` (minimal, surgical)
+
+- `Source.parse_meta` (JSON) and `SourceRef.page` added so ingestion can
+  attach format/page metadata. Extraction logic and the claim model are
+  otherwise unchanged; identical-bullet de-dupe within a source added.
+- `POST /api/sources/upload` now does **real** ingestion via
+  `ingestion.extract(...)` (multipart; 413 over size limit, 415
+  unsupported, 422 unreadable). The pasted-text path is unchanged.
+- `parse_document(text, page_map=None)` accepts an optional page map
+  (used only for PDF/DOCX). With no map it behaves exactly as before.
+- New export endpoints: `GET /api/packages/{id}/export` and
+  `…/export/preview`, plus `_export_model()` which applies the
+  provenance/exclusion gate before any renderer runs.
+- **Bug fixed**: `app.include_router(packages_router)` was called
+  *before* the export routes were defined, so FastAPI silently dropped
+  `/export` and `/export/preview` (they 404'd). The include was moved to
+  *after* all package routes are defined; both routes now register.
+
+## Explicitly NOT changed (non-negotiables honored)
+
+- No auto-apply / external submission; apply stays guarded scaffolding.
+- No LinkedIn scraping; no CAPTCHA / anti-bot circumvention.
+- No fabricated claims; AI never produces grounded content.
+- Provenance colours, claim controls, and package bullet
+  accept/reject/rewrite/lock behavior preserved.
+- The 13-step orchestrator and 5-agent council behavior preserved
+  (Axiom still blocks fabricated metrics).
+
+## Validation
+
+`pytest -q` → **63 passed**. Validated end-to-end with a real résumé
+(Pandoc-exported Markdown, 9.5 KB): upload → 62 claims with provenance /
+snippets / confidence (all `blue` grounded-résumé, all pending, every
+claim carries a source ref) → approve 8, reject 1 → strategy + job →
+package (draft, fit 84/100, 13 bullets across summary / experience /
+skills / cover_letter) → 5-agent council ready → all four exports return
+HTTP 200 (MD 1.1 KB, HTML 1.9 KB, valid DOCX zip 37 KB, `%PDF-` 2.6 KB)
+→ the rejected claim's text is absent from the default export and only
+re-appears under the explicit `include_unsupported=true` override. The
+bullet-level unsupported-metric gate is additionally covered by
+dedicated tests in `test_app.py`.

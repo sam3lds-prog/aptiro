@@ -1,0 +1,57 @@
+# Aptiro - production target (Decision 3): Postgres + pgvector.
+# Local dev/test can still use zero-config SQLite (see README); this
+# compose file is the production-shaped path.
+#
+#   docker compose up --build
+#   UI  -> http://localhost:5173
+#   API -> http://localhost:8000  (docs at /docs)
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: aptiro
+      POSTGRES_PASSWORD: aptiro
+      POSTGRES_DB: aptiro
+    ports:
+      - "5432:5432"
+    volumes:
+      - aptiro_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aptiro -d aptiro"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    environment:
+      APTIRO_DATABASE_URL: postgresql+psycopg2://aptiro:aptiro@db:5432/aptiro
+      APTIRO_AI_PROVIDER: mock          # Decision 2: deterministic default
+      APTIRO_SEED_ON_STARTUP: "1"
+      # To enable Anthropic instead, set:
+      # APTIRO_AI_PROVIDER: anthropic
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  frontend:
+    image: python:3.12-slim
+    working_dir: /srv
+    volumes:
+      - ./frontend:/srv:ro
+    # The UI is a single static file; it reads the API base from
+    # window.APTIRO_API (defaults to http://localhost:8000).
+    command: python -m http.server 5173
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+
+volumes:
+  aptiro_pgdata:

@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+# Build deps for psycopg2 + pdfplumber's image stack.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend/ .
+
+EXPOSE 8000
+
+# On the production Postgres path, apply migrations (creates the schema
+# + pgvector extension) and then serve. Migration failures are fatal so
+# we never serve against an unmigrated database.
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app:app --host 0.0.0.0 --port 8000"]
