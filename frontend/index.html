@@ -80,13 +80,27 @@ code{background:var(--panel2);padding:1px 5px;border-radius:5px;font-size:12px}
 const {useState,useEffect,useCallback,useRef} = React;
 const API = (window.APTIRO_API || "http://localhost:8000") + "/api";
 
+let _TOKEN = null;
+try { _TOKEN = window.localStorage.getItem("aptiro_token") || null; }
+catch(e) { _TOKEN = null; }
+function setToken(t){
+  _TOKEN = t || null;
+  try {
+    if(t) window.localStorage.setItem("aptiro_token", t);
+    else window.localStorage.removeItem("aptiro_token");
+  } catch(e) {}
+}
+
 async function api(path, opts={}) {
-  const r = await fetch(API+path, {
-    headers:{"Content-Type":"application/json"}, ...opts});
+  const headers = {"Content-Type":"application/json",
+                   ...(opts.headers||{})};
+  if(_TOKEN) headers["Authorization"] = "Bearer " + _TOKEN;
+  const r = await fetch(API+path, {...opts, headers});
   if(r.status===204) return null;
   const txt = await r.text();
   let data; try{ data = txt ? JSON.parse(txt) : null; }catch(e){ data = txt; }
-  if(!r.ok) throw new Error((data && data.detail) || ("HTTP "+r.status));
+  if(!r.ok){ const e=new Error((data && data.detail) || ("HTTP "+r.status));
+    e.status=r.status; throw e; }
   return data;
 }
 const PCOL = {blue:"bl-blue",purple:"bl-purple",green:"bl-green",
@@ -913,10 +927,71 @@ function Tracker({notify}){
 }
 
 
+function AuthScreen({onAuthed,notify}){
+  const [mode,setMode]=useState("login");
+  const [email,setEmail]=useState(""); const [pw,setPw]=useState("");
+  const [name,setName]=useState(""); const [busy,setBusy]=useState(false);
+  async function go(){
+    if(!email||pw.length<8){ notify("Email + 8+ char password"); return; }
+    setBusy(true);
+    try{
+      const ep = mode==="login"?"/auth/login":"/auth/register";
+      const body = mode==="login"?{email,password:pw}
+                                  :{email,password:pw,name};
+      const r = await api(ep,{method:"POST",
+        body:JSON.stringify(body)});
+      setToken(r.token); onAuthed(r);
+    }catch(e){ notify(e.message); }finally{ setBusy(false); }
+  }
+  return <div style={{maxWidth:380,margin:"80px auto"}}>
+    <div className="brand" style={{fontSize:22,marginBottom:4}}>APTIRO
+      <small>evidence-backed applications</small></div>
+    <div className="card">
+      <div className="row" style={{marginBottom:10}}>
+        <button className={"btn "+(mode==="login"?"":"sec")}
+          onClick={()=>setMode("login")}>Log in</button>
+        <button className={"btn "+(mode==="register"?"":"sec")}
+          onClick={()=>setMode("register")}>Register</button>
+      </div>
+      {mode==="register" && <><label className="f">Name</label>
+        <input value={name} onChange={e=>setName(e.target.value)}/></>}
+      <label className="f">Email</label>
+      <input value={email} onChange={e=>setEmail(e.target.value)}
+        placeholder="you@example.com"/>
+      <label className="f">Password</label>
+      <input type="password" value={pw}
+        onChange={e=>setPw(e.target.value)} placeholder="8+ characters"/>
+      <button className="btn" style={{marginTop:12,width:"100%"}}
+        disabled={busy} onClick={go}>
+        {mode==="login"?"Log in":"Create account"}</button>
+    </div>
+    <p className="sub" style={{textAlign:"center"}}>Your data is private
+      to your account. Aptiro never submits anything for you.</p>
+  </div>;
+}
+
 function App(){
   const [tab,setTab]=useState("dash");
   const [toast,setToast]=useState(null);
+  const [boot,setBoot]=useState(null);   // null=loading
+  const [me,setMe]=useState(null);
   const notify=(m)=>{ setToast(m); setTimeout(()=>setToast(null),4200); };
+  useEffect(()=>{ (async()=>{
+    try{
+      const h = await api("/health");
+      const authOn = h.auth && h.auth.enabled;
+      if(!authOn){ setBoot("ready"); return; }
+      try{ const m = await api("/auth/me");
+        if(m && !m.is_default){ setMe(m); setBoot("ready"); }
+        else setBoot("auth"); }
+      catch(e){ setBoot("auth"); }
+    }catch(e){ setBoot("ready"); }   // API down -> let views show errors
+  })(); },[]);
+  function logout(){ setToken(null); setMe(null); setBoot("auth"); }
+  if(boot===null) return <div className="sub"
+    style={{padding:40}}>Loading…</div>;
+  if(boot==="auth") return <AuthScreen notify={notify}
+    onAuthed={(u)=>{ setMe(u); setBoot("ready"); }}/>;
   const T={dash:Dashboard,vault:Vault,strategy:Strategy,jobs:Jobs,
     matches:Matches,packages:Packages,tracker:Tracker,apply:Apply,
     privacy:Privacy};
@@ -932,6 +1007,8 @@ function App(){
       {NAV.map(([k,l])=>
         <button key={k} className={tab===k?"on":""}
           onClick={()=>setTab(k)}>{l}</button>)}
+      {me && <button onClick={logout} style={{marginTop:"auto"}}
+        title={me.email}>Log out ({me.name||me.email})</button>}
     </div>
     <div className="main"><View go={setTab} notify={notify}/></div>
     {toast && <div className="toast">{toast}</div>}

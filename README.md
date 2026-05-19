@@ -1,4 +1,4 @@
-# Aptiro — Trust + Export + Discovery + Tracker (Phase 3)
+# Aptiro — Trust + Discovery + Tracker + Multi-user (Phase 4)
 
 Aptiro turns your own résumé/profile into **provenance-tracked claims**,
 discovers real jobs (paste a description or import a public posting URL
@@ -19,6 +19,14 @@ submitted, deterministic follow-up reminders, an ATS-safe plain-text
 export profile, and the tracker in the privacy export — with an explicit
 test proving no code path can submit anything anywhere. Built on the
 Delivery 1–4 contract without rewriting the app.
+
+**Phase 4 (multi-user, auth & data isolation)** adds optional accounts:
+register/login with stdlib-hashed passwords and bearer tokens, complete
+per-user data isolation (cross-user access returns 404 with no
+existence leak), per-user privacy export/wipe, and an Alembic migration
+that backfills existing data to a built-in `local` user. Auth is
+**off by default** — with no token the app is the same single-user tool
+as Phase 3, so nothing existing breaks and no account is forced.
 
 ---
 
@@ -55,7 +63,7 @@ docker compose up --build
 
 ```bash
 cd backend && . .venv/bin/activate
-pytest -q          # 99 tests, all green (63 P1 + 20 P2 + 16 P3; 0 removed)
+pytest -q          # 109 tests, all green (P1 63 + P2 20 + P3 16 + P4 10; 0 removed)
 ```
 
 Tests are deterministic and offline: in-memory SQLite, mock AI, no network.

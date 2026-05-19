@@ -22,6 +22,10 @@ Test: pytest -q
 """
 import os
 import re
+import hashlib as _hashlib
+import hmac as _hmac
+import secrets as _secrets
+from contextvars import ContextVar
 import uuid
 import importlib.util as _ilu
 import sys as _sys
@@ -79,6 +83,24 @@ JOB_PROVIDER = os.getenv("APTIRO_JOB_PROVIDER", "mock")
 SEARCH_PROVIDER = os.getenv("APTIRO_SEARCH_PROVIDER", "mock")
 NOTIFICATION_PROVIDER = os.getenv("APTIRO_NOTIFICATION_PROVIDER", "mock")
 SEED_ON_STARTUP = os.getenv("APTIRO_SEED_ON_STARTUP", "1") == "1"
+
+# --- Phase 4: multi-user & auth ------------------------------------------
+# AUTH defaults to OFF. With AUTH off, every request runs as the single
+# built-in "local" user, so the entire prior test suite and existing
+# single-user data behave EXACTLY as before. Turn it on to require a
+# bearer token for mutating requests and isolate data per user.
+AUTH_ENABLED = os.getenv("APTIRO_AUTH", "off").lower() in ("on", "1",
+                                                           "true")
+DEFAULT_UID = "local"
+DEFAULT_USER_EMAIL = "local@aptiro.local"
+_PW_ROUNDS = 120_000
+# Per-request current user id. Defaults to the local user so code paths
+# with no auth context (tests, single-user mode) just work.
+_CURRENT_UID = ContextVar("aptiro_uid", default=DEFAULT_UID)
+
+
+def _uid():
+    return _CURRENT_UID.get()
 # URL import guardrails (server-side fetch of a user-supplied public URL
 # only - never a crawler). All overridable via APTIRO_-prefixed env.
 URL_FETCH_TIMEOUT = float(os.getenv("APTIRO_URL_FETCH_TIMEOUT", "10"))
@@ -230,8 +252,19 @@ class ApplicationStatus(str, Enum):
 # ===========================================================================
 # Models
 # ===========================================================================
+class User(SQLModel, table=True):
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    email: str = Field(index=True)
+    name: str = ""
+    password_hash: str = ""
+    token: str = Field(default="", index=True)
+    is_default: bool = False
+    created_at: datetime = Field(default_factory=_now)
+
+
 class Source(SQLModel, table=True):
     id: str = Field(default_factory=_uuid, primary_key=True)
+    owner_id: str = Field(default=DEFAULT_UID, index=True)
     source_type: SourceType
     label: str
     filename: Optional[str] = None
@@ -244,6 +277,7 @@ class Source(SQLModel, table=True):
 
 class ProfileClaim(SQLModel, table=True):
     id: str = Field(default_factory=_uuid, primary_key=True)
+    owner_id: str = Field(default=DEFAULT_UID, index=True)
     source_id: str = Field(foreign_key="source.id", index=True)
     claim_text: str
     claim_type: ClaimType = ClaimType.achievement
@@ -284,6 +318,7 @@ DEFAULT_WEIGHTS = {
 
 class Strategy(SQLModel, table=True):
     id: str = Field(default_factory=_uuid, primary_key=True)
+    owner_id: str = Field(default=DEFAULT_UID, index=True)
     name: str = "Default Strategy"
     is_active: bool = True
     target_roles: List[str] = Field(default_factory=list,
@@ -306,6 +341,7 @@ class Strategy(SQLModel, table=True):
 
 class JobPosting(SQLModel, table=True):
     id: str = Field(default_factory=_uuid, primary_key=True)
+    owner_id: str = Field(default=DEFAULT_UID, index=True)
     title: str
     company: str
     location: Optional[str] = None
@@ -329,6 +365,7 @@ class JobPosting(SQLModel, table=True):
 
 class ApplicationPackage(SQLModel, table=True):
     id: str = Field(default_factory=_uuid, primary_key=True)
+    owner_id: str = Field(default=DEFAULT_UID, index=True)
     job_id: str = Field(foreign_key="jobposting.id", index=True)
     strategy_id: Optional[str] = Field(default=None,
                                        foreign_key="strategy.id")
@@ -431,6 +468,7 @@ class Application(SQLModel, table=True):
     user marks it submitted and is never rewritten - it is immutable
     evidence of exactly what was sent."""
     id: str = Field(default_factory=_uuid, primary_key=True)
+    owner_id: str = Field(default=DEFAULT_UID, index=True)
     package_id: str = Field(foreign_key="applicationpackage.id",
                             index=True)
     job_id: str = ""
@@ -465,11 +503,18 @@ def _ensure_additive_columns():
     loss. Postgres production still goes through Alembic; this keeps the
     zero-config SQLite path and any pre-existing DB self-healing."""
     from sqlalchemy import inspect as _inspect, text as _sql
+    _owner_ddl = ("VARCHAR" if not _IS_SQLITE else "TEXT")
     additive = {
         "jobposting": {
             "structured_requirements": "JSON" if not _IS_SQLITE
             else "TEXT",
+            "owner_id": _owner_ddl,
         },
+        "source": {"owner_id": _owner_ddl},
+        "profileclaim": {"owner_id": _owner_ddl},
+        "strategy": {"owner_id": _owner_ddl},
+        "applicationpackage": {"owner_id": _owner_ddl},
+        "application": {"owner_id": _owner_ddl},
     }
     try:
         insp = _inspect(engine)
@@ -490,14 +535,101 @@ def _ensure_additive_columns():
               file=_sys.stderr)
 
 
+def _backfill_owner_ids():
+    """Any row that predates Phase 4 gets the built-in local owner, so
+    existing single-user data stays visible exactly as before."""
+    from sqlalchemy import inspect as _inspect, text as _sql
+    tables = ("source", "profileclaim", "strategy", "jobposting",
+              "applicationpackage", "application")
+    try:
+        insp = _inspect(engine)
+        present = set(insp.get_table_names())
+        with engine.begin() as conn:
+            for t in tables:
+                if t not in present:
+                    continue
+                cols = {c["name"] for c in insp.get_columns(t)}
+                if "owner_id" not in cols:
+                    continue
+                conn.execute(_sql(
+                    f"UPDATE {t} SET owner_id = :u "
+                    f"WHERE owner_id IS NULL OR owner_id = ''"),
+                    {"u": DEFAULT_UID})
+    except Exception as exc:
+        print(f"[aptiro] owner backfill skipped: {exc!r}",
+              file=_sys.stderr)
+
+
+def _ensure_default_user():
+    """The single built-in 'local' user. With AUTH off everything runs
+    as this user, so prior behavior and data are unchanged."""
+    try:
+        with Session(engine) as s:
+            u = s.get(User, DEFAULT_UID)
+            if not u:
+                s.add(User(id=DEFAULT_UID, email=DEFAULT_USER_EMAIL,
+                           name="Local User", is_default=True,
+                           token=""))
+                s.commit()
+    except Exception as exc:
+        print(f"[aptiro] default user bootstrap skipped: {exc!r}",
+              file=_sys.stderr)
+
+
 def init_db():
     SQLModel.metadata.create_all(engine)
     _ensure_additive_columns()
+    _backfill_owner_ids()
+    _ensure_default_user()
 
 
 def get_session():
     with Session(engine) as s:
         yield s
+
+
+# --- Phase 4: auth + scoping helpers -------------------------------------
+def _hash_pw(password, salt=None):
+    salt = salt or _secrets.token_hex(16)
+    dk = _hashlib.pbkdf2_hmac("sha256", password.encode(),
+                              salt.encode(), _PW_ROUNDS)
+    return "%s$%s" % (salt, dk.hex())
+
+
+def _verify_pw(password, stored):
+    try:
+        salt, _ = stored.split("$", 1)
+    except (ValueError, AttributeError):
+        return False
+    return _hmac.compare_digest(_hash_pw(password, salt), stored)
+
+
+def _new_token():
+    return _secrets.token_urlsafe(32)
+
+
+def _bearer(request):
+    h = request.headers.get("authorization", "")
+    return h[7:].strip() if h.lower().startswith("bearer ") else ""
+
+
+def _scoped(session, model):
+    """Owner-filtered select for the current request's user. With AUTH
+    off the current uid is the local user and every row carries that
+    owner_id, so results are identical to the pre-Phase-4 behavior."""
+    return session.exec(
+        select(model).where(model.owner_id == _uid())).all()
+
+
+def _get_owned(session, model, obj_id):
+    """Fetch by id but only if it belongs to the current user; anything
+    owned by someone else is reported as not-found (no existence leak)."""
+    obj = session.get(model, obj_id)
+    if obj is None:
+        return None
+    if getattr(obj, "owner_id", _uid()) != _uid():
+        return None
+    return obj
 
 
 # ===========================================================================
@@ -677,6 +809,7 @@ def extract_claims(session, source):
             claim_type=_claim_type(line, metrics), company=line.company,
             role=line.role, date_range=line.date_range, skills=skills,
             metrics=metrics, confidence=conf,
+            owner_id=getattr(source, "owner_id", _uid()),
             approval_status=ApprovalStatus.pending)
         session.add(claim)
         session.flush()
@@ -827,7 +960,8 @@ def _dedupe_key(company, title, source_url):
 
 def _find_duplicate(session, company, title, source_url):
     key = _dedupe_key(company, title, source_url)
-    for j in session.exec(select(JobPosting)).all():
+    for j in session.exec(select(JobPosting).where(
+            JobPosting.owner_id == _uid())).all():
         if _dedupe_key(j.company, j.title, j.source_url) == key:
             return j
     return None
@@ -1119,7 +1253,8 @@ def claim_read(session, c):
 @sources_router.get("", response_model=List[SourceRead])
 def list_sources(session: Session = Depends(get_session)):
     rows = session.exec(
-        select(Source).order_by(Source.created_at.desc())).all()
+        select(Source).where(Source.owner_id == _uid())
+        .order_by(Source.created_at.desc())).all()
     return [_source_read(session, s) for s in rows]
 
 
@@ -1128,7 +1263,7 @@ def create_source(body: SourceCreate,
                    session: Session = Depends(get_session)):
     src = Source(source_type=body.source_type, label=body.label,
                  filename=body.filename, raw_text=body.raw_text,
-                 extracted_text=body.raw_text,
+                 extracted_text=body.raw_text, owner_id=_uid(),
                  parse_meta={"format": "text", "chars": len(body.raw_text)})
     session.add(src)
     session.commit()
@@ -1167,7 +1302,7 @@ async def upload_source(
                  "image; OCR is out of scope for this slice).")
     src = Source(
         source_type=source_type, label=file.filename or "Uploaded",
-        filename=file.filename, raw_text=result.text,
+        filename=file.filename, raw_text=result.text, owner_id=_uid(),
         extracted_text=result.text, parse_meta=result.meta)
     session.add(src)
     session.commit()
@@ -1195,7 +1330,7 @@ def delete_source(source_id: str,
 @claims_router.get("", response_model=List[ClaimRead])
 def list_claims(source_id: Optional[str] = None,
                 session: Session = Depends(get_session)):
-    q = select(ProfileClaim)
+    q = select(ProfileClaim).where(ProfileClaim.owner_id == _uid())
     if source_id:
         q = q.where(ProfileClaim.source_id == source_id)
     rows = session.exec(q.order_by(ProfileClaim.created_at)).all()
@@ -1235,9 +1370,10 @@ def update_claim(claim_id: str, body: ClaimUpdate,
 
 def _active_strategy(session):
     strat = session.exec(select(Strategy).where(
+        Strategy.owner_id == _uid(),
         Strategy.is_active == True)).first()  # noqa: E712
     if not strat:
-        strat = Strategy()
+        strat = Strategy(owner_id=_uid())
         session.add(strat)
         session.commit()
         session.refresh(strat)
@@ -1300,6 +1436,7 @@ def _job_read(j, deduplicated=False):
 @jobs_router.get("", response_model=List[JobRead])
 def list_jobs(session: Session = Depends(get_session)):
     rows = session.exec(select(JobPosting).where(
+        JobPosting.owner_id == _uid(),
         JobPosting.is_archived == False).order_by(  # noqa: E712
         JobPosting.imported_at.desc())).all()
     return [_job_read(j) for j in rows]
@@ -1312,6 +1449,7 @@ def create_job(body: JobImportRequest, response: Response,
         raise HTTPException(400, "description_text is required")
     job = import_job(body.description_text, body.source_url,
                      body.title, body.company)
+    job.owner_id = _uid()
     dup = _find_duplicate(session, job.company, job.title, job.source_url)
     if dup is not None:
         response.status_code = 200
@@ -1336,6 +1474,7 @@ def import_job_from_url(body: UrlImportRequest, response: Response,
         raise HTTPException(422, str(e))
     job = import_job(text, source_url=body.url, title=body.title,
                      company=body.company, source="url_import")
+    job.owner_id = _uid()
     dup = _find_duplicate(session, job.company, job.title, job.source_url)
     if dup is not None:
         response.status_code = 200
@@ -1348,7 +1487,7 @@ def import_job_from_url(body: UrlImportRequest, response: Response,
 
 @jobs_router.get("/{job_id}", response_model=JobRead)
 def get_job(job_id: str, session: Session = Depends(get_session)):
-    j = session.get(JobPosting, job_id)
+    j = _get_owned(session, JobPosting, job_id)
     if not j:
         raise HTTPException(404, "Job not found")
     return _job_read(j)
@@ -1448,6 +1587,53 @@ app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_methods=["*"], allow_headers=["*"])
+
+
+def _mw_session():
+    """Use the same session the app uses for requests - including any
+    test dependency override - so token resolution is consistent with
+    the data the request will see."""
+    override = app.dependency_overrides.get(get_session)
+    gen = (override or get_session)()
+    return next(gen), gen
+
+
+@app.middleware("http")
+async def _auth_context(request, call_next):
+    """Resolve the bearer token to a user id for the request. No token
+    -> the built-in local user (pre-Phase-4 behavior). When AUTH is
+    enabled, mutating methods require a valid token (read paths and the
+    auth/health endpoints stay open)."""
+    from starlette.responses import JSONResponse
+    token = _bearer(request)
+    uid = DEFAULT_UID
+    if token:
+        s, gen = _mw_session()
+        try:
+            u = s.exec(select(User).where(User.token == token)).first()
+        finally:
+            try:
+                next(gen)
+            except StopIteration:
+                pass
+        if u:
+            uid = u.id
+        elif AUTH_ENABLED:
+            return JSONResponse(
+                {"detail": "Invalid or expired token"}, status_code=401)
+    path = request.url.path
+    is_open = (path.startswith("/api/auth/")
+               or path == "/api/health" or path == "/"
+               or not path.startswith("/api/"))
+    if (AUTH_ENABLED and not token and not is_open
+            and request.method in ("POST", "PUT", "PATCH", "DELETE")):
+        return JSONResponse(
+            {"detail": "Authentication required"}, status_code=401)
+    tok = _CURRENT_UID.set(uid)
+    try:
+        return await call_next(request)
+    finally:
+        _CURRENT_UID.reset(tok)
 app.include_router(sources_router)
 app.include_router(claims_router)
 app.include_router(strategy_router)
@@ -1458,7 +1644,7 @@ app.include_router(jobs_router)
 def health():
     return {"status": "ok", "app": "Aptiro", "delivery": 4,
             "slice": "trust-export", "phase": 2,
-            "phases_shipped": [1, 2, 3],
+            "phases_shipped": [1, 2, 3], "latest_phase": 4,
             "providers": {"ai": AI_PROVIDER, "job": JOB_PROVIDER,
                           "search": SEARCH_PROVIDER,
                           "notification": NOTIFICATION_PROVIDER,
@@ -1473,7 +1659,11 @@ def health():
                 "affects_score": False},
             "application_tracker": {
                 "enabled": True, "auto_submit": False,
-                "immutable_snapshot": True}}
+                "immutable_snapshot": True},
+            "auth": {"enabled": AUTH_ENABLED,
+                     "mode": "multi_user" if AUTH_ENABLED
+                     else "single_user_local",
+                     "default_user": DEFAULT_UID}}
 
 
 # ===========================================================================
@@ -2014,6 +2204,7 @@ def _match_payload(session, job, strat):
 def list_matches(session: Session = Depends(get_session)):
     strat = _active_strategy(session)
     jobs = session.exec(select(JobPosting).where(
+        JobPosting.owner_id == _uid(),
         JobPosting.is_archived == False)).all()  # noqa: E712
     out = [_match_payload(session, j, strat) for j in jobs]
     out.sort(key=lambda m: m.score, reverse=True)
@@ -2102,7 +2293,7 @@ def build_package(session, job, strategy):
 
     pkg = ApplicationPackage(
         job_id=job.id, strategy_id=getattr(strategy, "id", None),
-        title=job.title, company=job.company,
+        title=job.title, company=job.company, owner_id=_uid(),
         status=PackageStatus.draft, score_snapshot=sc["score"],
         summary="Draft package for %s @ %s (fit %d/100)."
                 % (job.title, job.company, sc["score"]))
@@ -2304,7 +2495,8 @@ runs_router = APIRouter(tags=["runs"])
 
 @packages_router.get("", response_model=List[PackageOut])
 def list_packages(session: Session = Depends(get_session)):
-    rows = session.exec(select(ApplicationPackage).order_by(
+    rows = session.exec(select(ApplicationPackage).where(
+        ApplicationPackage.owner_id == _uid()).order_by(
         ApplicationPackage.created_at.desc())).all()
     return [_package_out(session, p) for p in rows]
 
@@ -2312,7 +2504,7 @@ def list_packages(session: Session = Depends(get_session)):
 @packages_router.post("", response_model=PackageOut, status_code=201)
 def create_package(body: PackageCreate,
                    session: Session = Depends(get_session)):
-    job = session.get(JobPosting, body.job_id)
+    job = _get_owned(session, JobPosting, body.job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     pkg = build_package(session, job, _active_strategy(session))
@@ -2321,7 +2513,7 @@ def create_package(body: PackageCreate,
 
 @packages_router.get("/{pkg_id}", response_model=PackageOut)
 def get_package(pkg_id: str, session: Session = Depends(get_session)):
-    pkg = session.get(ApplicationPackage, pkg_id)
+    pkg = _get_owned(session, ApplicationPackage, pkg_id)
     if not pkg:
         raise HTTPException(404, "Package not found")
     return _package_out(session, pkg)
@@ -3170,12 +3362,23 @@ def _row_dict(obj):
     return out
 
 
+def _scoped_rows(session, m):
+    """Owner-bearing models are filtered to the current user; child /
+    auxiliary tables (reachable only via an owned parent) are returned
+    as-is. In single-user / AUTH-off mode the current user owns
+    everything, so behavior is identical to before Phase 4."""
+    if hasattr(m, "owner_id"):
+        return session.exec(
+            select(m).where(m.owner_id == _uid())).all()
+    return session.exec(select(m)).all()
+
+
 def export_bundle(session):
     bundle = {"app": "Aptiro", "delivery": 4,
               "exported_at": _now().isoformat(), "data": {},
               "counts": {}}
     for m in _all_models():
-        rows = session.exec(select(m)).all()
+        rows = _scoped_rows(session, m)
         key = m.__tablename__
         bundle["data"][key] = [_row_dict(r) for r in rows]
         bundle["counts"][key] = len(rows)
@@ -3185,7 +3388,7 @@ def export_bundle(session):
 def wipe_all(session):
     removed = {}
     for m in _all_models():
-        rows = session.exec(select(m)).all()
+        rows = _scoped_rows(session, m)
         removed[m.__tablename__] = len(rows)
         for r in rows:
             session.delete(r)
@@ -3392,7 +3595,7 @@ def create_application(body: ApplicationCreate,
         raise HTTPException(404, "Package not found")
     job = session.get(JobPosting, pkg.job_id)
     a = Application(
-        package_id=pkg.id, job_id=pkg.job_id,
+        package_id=pkg.id, job_id=pkg.job_id, owner_id=_uid(),
         job_title=pkg.title or (job.title if job else ""),
         company=pkg.company or (job.company if job else ""),
         status=ApplicationStatus.drafted, note=body.note)
@@ -3406,7 +3609,8 @@ def create_application(body: ApplicationCreate,
 
 @applications_router.get("", response_model=List[ApplicationOut])
 def list_applications(session: Session = Depends(get_session)):
-    rows = session.exec(select(Application).order_by(
+    rows = session.exec(select(Application).where(
+        Application.owner_id == _uid()).order_by(
         Application.created_at.desc())).all()
     return [_app_out(a) for a in rows]
 
@@ -3415,7 +3619,8 @@ def list_applications(session: Session = Depends(get_session)):
 def export_applications_csv(session: Session = Depends(get_session)):
     import csv
     import io as _io
-    rows = session.exec(select(Application).order_by(
+    rows = session.exec(select(Application).where(
+        Application.owner_id == _uid()).order_by(
         Application.created_at)).all()
     buf = _io.StringIO()
     w = csv.writer(buf)
@@ -3435,7 +3640,7 @@ def export_applications_csv(session: Session = Depends(get_session)):
 @applications_router.get("/{app_id}", response_model=ApplicationOut)
 def get_application(app_id: str,
                     session: Session = Depends(get_session)):
-    a = session.get(Application, app_id)
+    a = _get_owned(session, Application, app_id)
     if not a:
         raise HTTPException(404, "Application not found")
     return _app_out(a)
@@ -3537,3 +3742,86 @@ def delete_application(app_id: str,
 
 
 app.include_router(applications_router)
+
+
+# ===========================================================================
+# Phase 4 - auth (register / login / me). Stdlib only (pbkdf2 + token);
+# no new dependencies, no live service. With AUTH off these endpoints
+# still work but are optional; with AUTH on, the token they issue is
+# required for mutating requests and scopes every owned entity.
+# ===========================================================================
+auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class AuthOut(BaseModel):
+    id: str
+    email: str
+    name: str
+    token: str
+
+
+class MeOut(BaseModel):
+    id: str
+    email: str
+    name: str
+    is_default: bool
+    auth_enabled: bool
+
+
+@auth_router.post("/register", response_model=AuthOut, status_code=201)
+def register(body: RegisterRequest,
+             session: Session = Depends(get_session)):
+    email = (body.email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(422, "A valid email is required")
+    if len(body.password or "") < 8:
+        raise HTTPException(422, "Password must be >= 8 characters")
+    if session.exec(select(User).where(User.email == email)).first():
+        raise HTTPException(409, "An account with that email exists")
+    u = User(email=email, name=(body.name or email.split("@")[0]),
+             password_hash=_hash_pw(body.password), token=_new_token())
+    session.add(u)
+    session.commit()
+    session.refresh(u)
+    return AuthOut(id=u.id, email=u.email, name=u.name, token=u.token)
+
+
+@auth_router.post("/login", response_model=AuthOut)
+def login(body: LoginRequest,
+          session: Session = Depends(get_session)):
+    email = (body.email or "").strip().lower()
+    u = session.exec(select(User).where(User.email == email)).first()
+    if not u or not _verify_pw(body.password or "", u.password_hash):
+        raise HTTPException(401, "Invalid email or password")
+    if not u.token:
+        u.token = _new_token()
+        session.add(u)
+        session.commit()
+        session.refresh(u)
+    return AuthOut(id=u.id, email=u.email, name=u.name, token=u.token)
+
+
+@auth_router.get("/me", response_model=MeOut)
+def whoami(session: Session = Depends(get_session)):
+    u = session.get(User, _uid())
+    if not u:
+        # default-user shim (AUTH off, no row needed elsewhere)
+        return MeOut(id=DEFAULT_UID, email=DEFAULT_USER_EMAIL,
+                     name="Local User", is_default=True,
+                     auth_enabled=AUTH_ENABLED)
+    return MeOut(id=u.id, email=u.email, name=u.name,
+                 is_default=u.is_default, auth_enabled=AUTH_ENABLED)
+
+
+app.include_router(auth_router)

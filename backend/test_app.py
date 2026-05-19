@@ -1282,3 +1282,202 @@ def test_health_advertises_phase3(client):
     assert h["phases_shipped"] == [1, 2, 3]
     assert h["application_tracker"]["auto_submit"] is False
     assert h["application_tracker"]["immutable_snapshot"] is True
+
+
+# ===========================================================================
+# Phase 4 - multi-user, auth & data isolation
+# ===========================================================================
+def _register(client, email, pw="password123", name=None):
+    r = client.post("/api/auth/register",
+                     json={"email": email, "password": pw,
+                           "name": name})
+    assert r.status_code == 201, r.json()
+    return r.json()
+
+
+def _auth(tok):
+    return {"Authorization": "Bearer " + tok}
+
+
+def test_register_login_me_roundtrip(client):
+    u = _register(client, "sam@example.com", name="Sam")
+    assert u["token"] and u["email"] == "sam@example.com"
+    bad = client.post("/api/auth/login",
+                       json={"email": "sam@example.com",
+                             "password": "wrong"})
+    assert bad.status_code == 401
+    ok = client.post("/api/auth/login",
+                      json={"email": "sam@example.com",
+                            "password": "password123"})
+    assert ok.status_code == 200 and ok.json()["token"]
+    me = client.get("/api/auth/me", headers=_auth(u["token"])).json()
+    assert me["email"] == "sam@example.com" and me["id"] == u["id"]
+
+
+def test_register_rejects_dupes_and_weak_input(client):
+    _register(client, "dupe@example.com")
+    assert client.post("/api/auth/register",
+                       json={"email": "dupe@example.com",
+                             "password": "password123"}
+                       ).status_code == 409
+    assert client.post("/api/auth/register",
+                       json={"email": "x@example.com",
+                             "password": "short"}).status_code == 422
+    assert client.post("/api/auth/register",
+                       json={"email": "nope", "password": "password123"}
+                       ).status_code == 422
+
+
+def test_password_is_hashed_not_stored_plaintext(client, session):
+    import app as _A
+    _register(client, "secure@example.com", pw="supersecret1")
+    u = session.exec(_A.select(_A.User).where(
+        _A.User.email == "secure@example.com")).first()
+    assert u is not None
+    assert "supersecret1" not in (u.password_hash or "")
+    assert "$" in u.password_hash            # salt$hash form
+    assert _A._verify_pw("supersecret1", u.password_hash)
+    assert not _A._verify_pw("wrong", u.password_hash)
+
+
+def test_cross_user_data_isolation(client):
+    a = _register(client, "a@example.com")
+    b = _register(client, "b@example.com")
+    # user A creates a source + a job
+    client.post("/api/sources",
+                json={"source_type": "resume", "label": "A resume",
+                      "raw_text": "Built ML products. Led teams. "
+                      "Shipped analytics dashboards to customers."},
+                headers=_auth(a["token"]))
+    client.post("/api/jobs",
+                json={"description_text": "Title: A Job\nCompany: AC\n"
+                      "- requirement one\n- requirement two"},
+                headers=_auth(a["token"]))
+    a_srcs = client.get("/api/sources", headers=_auth(a["token"])).json()
+    a_jobs = client.get("/api/jobs", headers=_auth(a["token"])).json()
+    assert len(a_srcs) == 1 and len(a_jobs) == 1
+    # user B sees NOTHING of A's
+    b_srcs = client.get("/api/sources", headers=_auth(b["token"])).json()
+    b_jobs = client.get("/api/jobs", headers=_auth(b["token"])).json()
+    assert b_srcs == [] and b_jobs == []
+    # B cannot fetch A's job by id (no existence leak -> 404)
+    assert client.get("/api/jobs/" + a_jobs[0]["id"],
+                      headers=_auth(b["token"])).status_code == 404
+    # A still sees its own by id
+    assert client.get("/api/jobs/" + a_jobs[0]["id"],
+                      headers=_auth(a["token"])).status_code == 200
+
+
+def test_cross_user_package_and_claims_isolation(client):
+    a = _register(client, "pa@example.com")
+    b = _register(client, "pb@example.com")
+    client.post("/api/sources",
+                json={"source_type": "resume", "label": "r",
+                      "raw_text": "Led product strategy for an AI "
+                      "platform driving $20M revenue. Managed teams."},
+                headers=_auth(a["token"]))
+    cl = client.get("/api/claims", headers=_auth(a["token"])).json()
+    assert cl and all(c for c in cl)
+    for c in cl[:3]:
+        client.patch("/api/claims/" + c["id"],
+                     json={"approval_status": "approved"},
+                     headers=_auth(a["token"]))
+    client.post("/api/jobs",
+                json={"description_text": "Title: PM\nCompany: Z\n"
+                      "- product strategy\n- AI platform"},
+                headers=_auth(a["token"]))
+    jid = client.get("/api/jobs", headers=_auth(a["token"])
+                     ).json()[0]["id"]
+    pk = client.post("/api/packages", json={"job_id": jid},
+                     headers=_auth(a["token"]))
+    assert pk.status_code == 201
+    pid = pk.json()["id"]
+    # B sees no claims, no packages, and cannot read A's package
+    assert client.get("/api/claims",
+                      headers=_auth(b["token"])).json() == []
+    assert client.get("/api/packages",
+                      headers=_auth(b["token"])).json() == []
+    assert client.get("/api/packages/" + pid,
+                      headers=_auth(b["token"])).status_code == 404
+    # B cannot build a package from A's job id either
+    assert client.post("/api/packages", json={"job_id": jid},
+                       headers=_auth(b["token"])).status_code == 404
+
+
+def test_privacy_export_is_per_user(client):
+    a = _register(client, "px@example.com")
+    b = _register(client, "py@example.com")
+    client.post("/api/sources",
+                json={"source_type": "resume", "label": "r",
+                      "raw_text": "Shipped data products and dashboards "
+                      "to enterprise customers. Led cross-functional."},
+                headers=_auth(a["token"]))
+    ax = client.get("/api/privacy/export",
+                    headers=_auth(a["token"])).json()
+    bx = client.get("/api/privacy/export",
+                    headers=_auth(b["token"])).json()
+    assert ax["counts"]["source"] >= 1
+    assert bx["counts"]["source"] == 0
+    assert bx["counts"].get("profileclaim", 0) == 0
+    # B's wipe must not touch A's data
+    client.delete("/api/privacy/data", headers=_auth(b["token"]))
+    still = client.get("/api/sources", headers=_auth(a["token"])).json()
+    assert len(still) == 1
+
+
+def test_default_user_backcompat_no_auth(client):
+    # No Authorization header at all -> behaves as the single local user
+    client.post("/api/sources",
+                json={"source_type": "resume", "label": "legacy",
+                      "raw_text": "Managed product roadmaps and shipped "
+                      "ML features used by thousands of customers."})
+    srcs = client.get("/api/sources").json()
+    assert len(srcs) == 1
+    me = client.get("/api/auth/me").json()
+    assert me["is_default"] is True and me["id"] == "local"
+
+
+def test_auth_enforced_on_mutations_when_enabled(client, monkeypatch):
+    import app as _A
+    monkeypatch.setattr(_A, "AUTH_ENABLED", True)
+    # mutation without a token -> 401
+    assert client.post("/api/sources",
+                       json={"source_type": "resume", "label": "x",
+                             "raw_text": "some resume text here for "
+                             "the parser to chew on nicely"}
+                       ).status_code == 401
+    # reads and auth endpoints stay open
+    assert client.get("/api/health").status_code == 200
+    u = _register(client, "gate@example.com")
+    # same mutation WITH a valid token -> ok
+    assert client.post("/api/sources",
+                       json={"source_type": "resume", "label": "x",
+                             "raw_text": "some resume text here for "
+                             "the parser to chew on nicely"},
+                       headers=_auth(u["token"])).status_code == 201
+    # a bogus token -> 401
+    assert client.get("/api/sources",
+                      headers=_auth("not-a-real-token")
+                      ).status_code == 401
+
+
+def test_health_advertises_phase4(client):
+    h = client.get("/api/health").json()
+    assert h["phases_shipped"] == [1, 2, 3]      # pinned, unchanged
+    assert h["latest_phase"] == 4
+    assert h["auth"]["enabled"] is False         # default off
+    assert h["auth"]["mode"] == "single_user_local"
+
+
+def test_phase4_migration_is_reversible():
+    import importlib.util
+    import pathlib
+    p = pathlib.Path(__file__).parent / "alembic" / "versions"
+    f = next(p.glob("0004_*.py"))
+    spec = importlib.util.spec_from_file_location("m0004", f)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    assert m.down_revision == "0003_phase3_application_tracker"
+    assert callable(m.upgrade) and callable(m.downgrade)
+    src = f.read_text()
+    assert "user" in src and "owner_id" in src

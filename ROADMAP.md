@@ -118,7 +118,14 @@ inclusion.
 
 ---
 
-## Phase 4 — Multi-user, auth & data isolation
+## Phase 4 — Multi-user, auth & data isolation  ✅ DELIVERED
+
+> Shipped. Test suite 99 → 109. See `CHANGES.md` for the full diff.
+> Stdlib-hashed accounts + bearer tokens, request-scoped identity,
+> complete per-user isolation (404-no-leak), per-user privacy
+> export/wipe, Alembic 0004 with backfill. Auth off by default — the
+> default-user shim keeps every prior test and existing deployment
+> behaving exactly as before.
 
 **Why.** Required before any deployment beyond a single local user —
 even a private self-hosted instance. It touches every entity, so it is

@@ -1,3 +1,91 @@
+# CHANGES — Phase 4: Multi-user, auth & data isolation
+
+Phase 4 is **additive and behavior-preserving** via a default-user
+shim. Every Phase 1–3 + Delivery 1–4 invariant is untouched: the suite
+stays green and grew **99 → 109** (10 new tests, 0 removed, 0 modified).
+Single-file `app.py` shape preserved; no new dependencies (auth is
+stdlib `pbkdf2_hmac` + `secrets`). With auth **off** (the default),
+every request runs as the built-in `local` user and the app behaves
+exactly as it did in Phase 3.
+
+## Added
+
+- **`User` model + `/api/auth`** (`register`, `login`, `me`). Passwords
+  are salted PBKDF2-HMAC-SHA256 (120k rounds, stdlib); login issues an
+  opaque bearer token. No new packages, no external service.
+- **`owner_id` on the six owner-rooted tables** (`source`,
+  `profileclaim`, `strategy`, `jobposting`, `applicationpackage`,
+  `application`), defaulted to the `local` user. Child tables
+  (bullets, refs, runs, …) are reachable only through an owned parent,
+  so scoping the roots gives complete isolation.
+- **Request-scoped identity.** An ASGI middleware resolves the bearer
+  token to a user id into a `ContextVar` (default = `local`). It uses
+  the *same* session the request will use (honouring test overrides),
+  so token resolution and data are always consistent.
+- **Per-user scoping.** `_scoped()` / `_get_owned()` filter every list
+  and get-by-id path for the owned resources; cross-user access returns
+  **404 with no existence leak**. Creates stamp `owner_id` from the
+  caller. Dedupe, the active-strategy lookup, matches, and the privacy
+  export/wipe are all per-user.
+- **Auth enforcement (opt-in).** With `APTIRO_AUTH=on`, mutating methods
+  (POST/PUT/PATCH/DELETE) require a valid token (401 otherwise); reads
+  and `/api/auth/*` + `/api/health` stay open. Default is off, so the
+  full prior suite and existing single-user data are unaffected.
+- **Self-heal + migration.** The additive column self-heal now also
+  adds `owner_id`, and a backfill assigns every pre-Phase-4 row to the
+  `local` user (no data loss). Alembic
+  `0004_phase4_multiuser_auth` creates the `user` table, adds the
+  columns + indexes, backfills, and seeds the local user — reversible.
+- **Frontend.** A login/register screen that appears **only** when the
+  server reports auth enabled (otherwise the app loads straight through,
+  unchanged); the token is attached to every API call; a "Log out"
+  control shows the signed-in account.
+- **Tests (`test_app.py`, +10):** register/login/me roundtrip; dupe +
+  weak-input rejection; password is hashed not stored; cross-user
+  source/job isolation incl. 404-no-leak; cross-user package/claims
+  isolation incl. can't-build-from-others'-job; per-user privacy export
+  and scoped wipe; default-user back-compat with no token; auth
+  enforced on mutations when enabled (401 without / 201 with / 401 bad
+  token); Phase-4 health; migration reversibility.
+
+## Changed in `app.py` (surgical, additive only)
+
+- Six models gain a defaulted `owner_id`; `extract_claims` propagates
+  the source's owner to its claims. List/get/create paths for the owned
+  resources go through `_scoped`/`_get_owned` and stamp `owner_id` — in
+  AUTH-off mode the current user owns everything, so results are
+  identical to before.
+- `/api/health` adds a non-pinned `latest_phase: 4` and an `auth`
+  block. `phase` stays `2` and `phases_shipped` stays `[1,2,3]` **on
+  purpose** — both are pinned by earlier tests, and "behavior-preserving,
+  tests only grow" outranks cosmetics. `latest_phase` is the live
+  indicator going forward.
+
+## Explicitly NOT changed (non-negotiables honored)
+
+- Default behavior is single-user and auth-free — zero friction, no
+  forced accounts, existing data fully visible to the `local` user.
+- No auto-submit / external submission / network egress; no crawling,
+  LinkedIn/auth-walled scraping, or CAPTCHA bypass; no fabricated
+  content. Provenance gate, claim controls, bullet
+  accept/reject/rewrite/lock, the council, the Axiom block, the export
+  trust gate, the Phase 2 deterministic score + secondary semantic
+  signal, and the Phase 3 immutable tracker snapshot are all unchanged.
+- Credentials are never logged or exported; the `user` table is not in
+  the privacy bundle (no cross-account credential leak).
+
+## Validation
+
+`pytest -q` → **109 passed**. End-to-end with a real résumé: two users
+register; Sam uploads his résumé (62 owner-stamped claims); Bob sees 0
+sources / 0 claims and gets **404** on every one of Sam's resources
+incl. building a package from Sam's job id; privacy export and wipe are
+per-user (Bob's wipe leaves Sam's data intact); with no token the app
+is the single `local` user exactly as in Phase 3; health reports
+`latest_phase 4`, `auth.enabled false` by default.
+
+---
+
 # CHANGES — Phase 3: Application tracker (close the loop, human-in-loop only)
 
 Phase 3 is **additive and behavior-preserving**. Every Phase 1 + 2 +
