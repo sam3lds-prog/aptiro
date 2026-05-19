@@ -15,6 +15,11 @@ fabricating resume facts.
 import hashlib
 import os
 
+# Hard cost/latency ceilings so the optional real path can never run
+# away. Both env-tunable; the mock ignores them (it is instant).
+AI_MAX_TOKENS = int(os.getenv("APTIRO_AI_MAX_TOKENS", "700"))
+AI_TIMEOUT = float(os.getenv("APTIRO_AI_TIMEOUT", "20"))
+
 
 class AIProvider:
     name = "base"
@@ -48,13 +53,16 @@ class AnthropicProvider(AIProvider):
     def __init__(self):
         import anthropic  # raises if SDK absent -> caller falls back
         self._client = anthropic.Anthropic(
-            api_key=os.environ["ANTHROPIC_API_KEY"])
+            api_key=os.environ["ANTHROPIC_API_KEY"],
+            timeout=AI_TIMEOUT)
         self._model = os.getenv("APTIRO_ANTHROPIC_MODEL",
                                 "claude-sonnet-4-5")
 
     def complete(self, prompt, *, system="", max_tokens=512):
+        # Cap tokens at the configured ceiling regardless of caller.
+        capped = min(int(max_tokens or 512), AI_MAX_TOKENS)
         msg = self._client.messages.create(
-            model=self._model, max_tokens=max_tokens,
+            model=self._model, max_tokens=capped,
             system=system or "You are a careful resume assistant. Never "
             "invent facts, metrics, employers, titles, or dates. Only "
             "rephrase or organize text the user already provided.",

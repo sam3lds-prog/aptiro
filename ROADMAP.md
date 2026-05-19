@@ -152,7 +152,14 @@ required on mutations, scoped privacy export, migration up/down.
 
 ---
 
-## Phase 5 — Grounded AI assist (real provider depth, provenance-safe)
+## Phase 5 — Grounded AI assist (real provider depth, provenance-safe)  ✅ DELIVERED
+
+> Shipped. Test suite 109 → 122. See `CHANGES.md` for the full diff.
+> Mandatory provenance verification gate, gated bullet rewrite and
+> cover-letter drafting (never auto-applied), advisory deterministic
+> council narrative, hardened opt-in Anthropic path. Mock stays the
+> default — app + full suite run offline with no key; every AI output
+> is gated so the model suggests phrasing, never facts.
 
 **Why.** The AI provider is pluggable but mock-only in practice. Making
 the Anthropic path genuinely useful — bullet rewriting, cover-letter

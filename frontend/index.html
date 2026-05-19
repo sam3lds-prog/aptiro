@@ -593,6 +593,32 @@ function Packages({notify}){
       setEdit(null); setPkg(await api("/packages/"+sel)); setPreview(null);
     }catch(e){ notify(e.message); }
   }
+  async function aiSuggest(b){
+    try{
+      const r=await api("/packages/"+sel+"/bullets/"+b.id+"/ai-rewrite",
+        {method:"POST",body:JSON.stringify({})});
+      if(!r.grounded){
+        notify("AI suggestion BLOCKED by the grounding gate: "
+          +(r.violations[0]||"introduces unsupported facts")
+          +" — not applied.");
+        return;
+      }
+      setEdit(b.id); setDraft(r.suggestion);
+      notify("AI suggestion is grounded in your evidence ("+r.provider
+        +"). Review and Save to apply, or edit further.");
+    }catch(e){ notify(e.message); }
+  }
+  async function aiCover(){
+    try{
+      const r=await api("/packages/"+sel+"/ai-cover-letter?apply=true",
+        {method:"POST"});
+      notify(r.grounded
+        ? "Cover letter drafted from your accepted bullets ("+r.provider+")."
+        : "Cover-letter draft BLOCKED by the grounding gate: "
+          +(r.violations[0]||"unsupported facts")+" — not saved.");
+      setPkg(await api("/packages/"+sel));
+    }catch(e){ notify(e.message); }
+  }
   async function orchestrate(){
     setBusy(true);
     try{ const r=await api("/packages/"+sel+"/orchestrate",{method:"POST"});
@@ -692,6 +718,8 @@ function Packages({notify}){
           <button className="btn" onClick={doExport}>
             Download {exArt} · {exFmt.toUpperCase()}</button>
           <button className="btn sec" onClick={loadPreview}>Preview gate</button>
+          <button className="btn sec" title={"Drafts only from accepted bullets; ungrounded drafts are never saved"}
+            onClick={aiCover}>✦ AI cover letter</button>
           <button className="btn sec" onClick={async()=>{
             try{ const a=await api("/applications",{method:"POST",
               body:JSON.stringify({package_id:sel})});
@@ -757,6 +785,8 @@ function Packages({notify}){
                   onClick={()=>act(b,{status:"accepted"})}>Accept</button>
                 <button className="btn mini sec" onClick={()=>{
                   setEdit(b.id);setDraft(b.current_text);}}>Rewrite</button>
+                <button className="btn ghost mini" title={"Grounded AI rephrase — blocked if it adds any fact not in your evidence"}
+                  onClick={()=>aiSuggest(b)}>✦ AI suggest</button>
                 <button className="btn ghost mini"
                   onClick={()=>act(b,{status:"locked"})}>Lock</button>
                 <button className="btn ghost mini"

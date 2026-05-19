@@ -1481,3 +1481,211 @@ def test_phase4_migration_is_reversible():
     assert callable(m.upgrade) and callable(m.downgrade)
     src = f.read_text()
     assert "user" in src and "owner_id" in src
+
+
+# ===========================================================================
+# Phase 5 - grounded AI assist (provenance verification gate)
+# ===========================================================================
+import app as _APP
+
+
+class _Stub:
+    """Injectable provider returning a fixed string (to simulate a real
+    model that does - or does not - fabricate)."""
+    def __init__(self, text, name="stub"):
+        self._t = text
+        self.name = name
+
+    def complete(self, prompt, *, system="", max_tokens=512):
+        return self._t
+
+
+def _use_provider(monkeypatch, provider):
+    monkeypatch.setattr(_APP, "_ai_provider", lambda: provider)
+
+
+def _exp_bullet(p):
+    return next(b for b in p["bullets"]
+                if b["section"] == "experience" and b["claim_id"])
+
+
+# --- the verification gate (unit) ---------------------------------------
+def test_gate_blocks_fabricated_metric_and_entity(session):
+    import app as A
+    c = A.ProfileClaim(source_id="s", claim_text="Led product strategy "
+                        "for an analytics platform.",
+                        claim_type=A.ClaimType.achievement,
+                        metrics=[], skills=["product strategy"])
+    # clean rephrase of the same facts -> grounded
+    assert A.verify_grounded(
+        session, "Led product strategy for the analytics platform.",
+        c) == []
+    # fabricated metric -> blocked
+    v = A.verify_grounded(
+        session, "Drove $999M in revenue on the analytics platform.", c)
+    assert any("999" in x for x in v)
+    # fabricated employer entity -> blocked
+    v2 = A.verify_grounded(
+        session, "Led product strategy at Globex Corporation.", c)
+    assert any("Globex" in x for x in v2)
+    # no claim at all -> cannot be grounded
+    assert A.verify_grounded(session, "anything", None)
+
+
+# --- ai-rewrite endpoint -------------------------------------------------
+def test_ai_rewrite_mock_is_deterministic_and_not_auto_applied(client):
+    pid, p = _package_with_accepted(client)
+    b = _exp_bullet(p)
+    r1 = client.post("/api/packages/%s/bullets/%s/ai-rewrite"
+                     % (pid, b["id"]), json={})
+    assert r1.status_code == 200
+    j1 = r1.json()
+    assert j1["provider"] == "mock"
+    assert j1["applied"] is False           # never auto-applies
+    r2 = client.post("/api/packages/%s/bullets/%s/ai-rewrite"
+                     % (pid, b["id"]), json={})
+    assert r2.json()["suggestion"] == j1["suggestion"]   # deterministic
+    # bullet text is unchanged on disk
+    cur = client.get("/api/packages/" + pid).json()
+    nb = next(x for x in cur["bullets"] if x["id"] == b["id"])
+    assert nb["current_text"] == b["current_text"]
+
+
+def test_ai_rewrite_grounded_apply_keeps_original(client, monkeypatch):
+    pid, p = _package_with_accepted(client)
+    b = _exp_bullet(p)
+    # a stub that only rephrases generic words -> grounded
+    _use_provider(monkeypatch, _Stub("Led and delivered the work."))
+    r = client.post("/api/packages/%s/bullets/%s/ai-rewrite"
+                    % (pid, b["id"]), json={"apply": True})
+    j = r.json()
+    assert j["grounded"] is True and j["applied"] is True
+    cur = client.get("/api/packages/" + pid).json()
+    nb = next(x for x in cur["bullets"] if x["id"] == b["id"])
+    assert nb["current_text"] == "Led and delivered the work."
+    assert nb["original_text"] == b["current_text"]   # original kept
+    assert nb["status"] == "rewritten"
+
+
+def test_ai_rewrite_fabricated_metric_is_blocked_not_applied(
+        client, monkeypatch):
+    """The Phase 5 contract test: a model that fabricates a metric must
+    be caught by the gate and never written to the package."""
+    pid, p = _package_with_accepted(client)
+    b = _exp_bullet(p)
+    _use_provider(monkeypatch,
+                  _Stub("Drove $999M ARR and 250% growth at Initech."))
+    r = client.post("/api/packages/%s/bullets/%s/ai-rewrite"
+                    % (pid, b["id"]), json={"apply": True})
+    j = r.json()
+    assert j["grounded"] is False
+    assert j["applied"] is False
+    assert any("999" in v for v in j["violations"])
+    # the bullet on disk is completely untouched
+    cur = client.get("/api/packages/" + pid).json()
+    nb = next(x for x in cur["bullets"] if x["id"] == b["id"])
+    assert nb["current_text"] == b["current_text"]
+    assert "999" not in nb["current_text"]
+
+
+def test_ai_rewrite_unlinked_bullet_cannot_be_grounded(client,
+                                                       monkeypatch):
+    pid, p = _package_with_accepted(client)
+    # a summary bullet with no claim link (AI-synthesized positioning)
+    nolink = next((b for b in p["bullets"] if not b["claim_id"]), None)
+    if nolink is None:
+        return  # nothing to assert on this seed; not a failure
+    _use_provider(monkeypatch, _Stub("Anything at all."))
+    j = client.post("/api/packages/%s/bullets/%s/ai-rewrite"
+                    % (pid, nolink["id"]),
+                    json={"apply": True}).json()
+    assert j["grounded"] is False and j["applied"] is False
+
+
+# --- ai cover letter -----------------------------------------------------
+def test_ai_cover_letter_requires_accepted_bullets(client):
+    pid = _package(client)        # built but nothing accepted
+    r = client.post("/api/packages/%s/ai-cover-letter" % pid)
+    assert r.status_code == 409
+
+
+def test_ai_cover_letter_gated_against_accepted_evidence(
+        client, monkeypatch):
+    pid, _ = _package_with_accepted(client)
+    _use_provider(monkeypatch, _Stub(
+        "I increased revenue by $880M at Hooli."))   # fabricated
+    j = client.post("/api/packages/%s/ai-cover-letter?apply=true"
+                    % pid).json()
+    assert j["grounded"] is False and j["applied"] is False
+    pkg = client.get("/api/packages/" + pid).json()
+    assert "$880M" not in (pkg["cover_letter"] or "")
+
+
+# --- provider default / fallback ----------------------------------------
+def test_mock_is_default_and_deterministic():
+    import ai_provider
+    assert ai_provider.active_provider_name() == "mock"
+    a = ai_provider.get_provider().complete("hello", system="s")
+    b = ai_provider.get_provider().complete("hello", system="s")
+    assert a == b and "mock-ai" in a
+
+
+def test_anthropic_without_key_falls_back_to_mock(monkeypatch):
+    import importlib
+    import ai_provider
+    monkeypatch.setenv("APTIRO_AI_PROVIDER", "anthropic")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    importlib.reload(ai_provider)
+    try:
+        assert ai_provider.get_provider().name == "mock"
+    finally:
+        monkeypatch.setenv("APTIRO_AI_PROVIDER", "mock")
+        importlib.reload(ai_provider)
+
+
+def test_ai_applied_bullet_still_under_provenance_gate(client,
+                                                       monkeypatch):
+    """AI never bypasses the existing guarantees: a rewritten bullet
+    whose claim is rejected still cannot be accepted (409)."""
+    pid, p = _package_with_accepted(client)
+    b = _exp_bullet(p)
+    _use_provider(monkeypatch, _Stub("Led and delivered the work."))
+    client.post("/api/packages/%s/bullets/%s/ai-rewrite"
+                % (pid, b["id"]), json={"apply": True})
+    # reject the linked claim, then try to accept the AI-rewritten bullet
+    client.patch("/api/claims/" + b["claim_id"],
+                 json={"approval_status": "rejected"})
+    r = client.patch("/api/packages/%s/bullets/%s" % (pid, b["id"]),
+                     json={"status": "accepted"})
+    assert r.status_code == 409
+
+
+# --- council narrative (advisory, deterministic) ------------------------
+def test_council_narrative_is_advisory_and_deterministic(client):
+    pid, _ = _package_with_accepted(client)
+    client.post("/api/packages/%s/orchestrate" % pid)
+    r1 = client.post("/api/packages/%s/ai-council-narrative" % pid)
+    assert r1.status_code == 200
+    j1 = r1.json()
+    assert j1["provider"] == "mock"
+    j2 = client.post("/api/packages/%s/ai-council-narrative"
+                     % pid).json()
+    assert j2["narrative"] == j1["narrative"]      # deterministic
+    # narrative does not change readiness or the run
+    runs = client.get("/api/packages/%s/runs" % pid).json()
+    assert runs and runs[0]["ready"] == j1["ready"]
+
+
+def test_council_narrative_requires_a_run(client):
+    pid = _package(client)
+    assert client.post("/api/packages/%s/ai-council-narrative" % pid
+                       ).status_code == 409
+
+
+def test_health_advertises_phase5_ai_assist(client):
+    h = client.get("/api/health").json()
+    assert h["latest_phase"] == 4                  # pinned, unchanged
+    ai = h["ai_assist"]
+    assert ai["provider"] == "mock"
+    assert ai["grounding_gate"] is True
+    assert ai["auto_apply"] is False

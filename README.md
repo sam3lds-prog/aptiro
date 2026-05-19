@@ -1,4 +1,4 @@
-# Aptiro — Trust + Discovery + Tracker + Multi-user (Phase 4)
+# Aptiro — Trust + Discovery + Tracker + Multi-user + AI assist (Phase 5)
 
 Aptiro turns your own résumé/profile into **provenance-tracked claims**,
 discovers real jobs (paste a description or import a public posting URL
@@ -27,6 +27,15 @@ existence leak), per-user privacy export/wipe, and an Alembic migration
 that backfills existing data to a built-in `local` user. Auth is
 **off by default** — with no token the app is the same single-user tool
 as Phase 3, so nothing existing breaks and no account is forced.
+
+**Phase 5 (grounded AI assist)** adds optional, provenance-safe AI help:
+gated bullet rewrite and cover-letter drafting, plus an advisory council
+narrative. A mandatory verification gate rejects any AI output that
+introduces a metric, number, or entity not present in your approved
+evidence — the model may improve phrasing, never invent facts, and
+nothing is auto-applied. The deterministic mock provider is the default,
+so the app and full test suite run offline with no API key; the real
+Anthropic path is opt-in and equally gated.
 
 ---
 
@@ -63,7 +72,7 @@ docker compose up --build
 
 ```bash
 cd backend && . .venv/bin/activate
-pytest -q          # 109 tests, all green (P1 63 + P2 20 + P3 16 + P4 10; 0 removed)
+pytest -q          # 122 tests, all green (P1 63 + P2 20 + P3 16 + P4 10 + P5 13; 0 removed)
 ```
 
 Tests are deterministic and offline: in-memory SQLite, mock AI, no network.

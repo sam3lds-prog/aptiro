@@ -1,3 +1,95 @@
+# CHANGES — Phase 5: Grounded AI assist (provenance-safe)
+
+Phase 5 is **additive and behavior-preserving**. Every Phase 1–4 +
+Delivery 1–4 invariant is untouched: the suite stays green and grew
+**109 → 122** (13 new tests, 0 removed, 0 modified). Single-file
+`app.py` shape preserved; no schema change, so **no migration**. No new
+dependencies — the mock provider stays the default and the whole suite
+runs offline with no key. The defining guarantee: **AI may suggest
+phrasing, never facts** — every AI output passes a provenance
+verification gate before it can touch a package.
+
+## Added
+
+- **Provenance verification gate** (`verify_grounded`). A
+  post-generation check applied to *any* AI text before it can be
+  stored: it rejects output that introduces a hard fact — a metric, a
+  standalone number, or a proper-noun entity — that is not present in
+  the linked approved claim's evidence. This is the pre-emptive
+  complement to Axiom's existing fabricated-metric block (Axiom catches
+  it in the council; the gate stops it ever being written).
+- **Grounded AI bullet rewrite** —
+  `POST /api/packages/{id}/bullets/{bid}/ai-rewrite`. Prompts the
+  provider with *only* the linked claim's evidence, runs the gate on the
+  result, and returns `{suggestion, grounded, violations, applied}`. It
+  **never auto-applies**: `apply=true` writes the suggestion *only if
+  grounded*, preserving `original_text` and setting status `rewritten`.
+  A bullet with no linked approved claim cannot be grounded at all.
+- **Grounded AI cover letter** —
+  `POST /api/packages/{id}/ai-cover-letter`. Drafts strictly from the
+  package's *accepted* bullets, gates the draft against the union of
+  their evidence, and saves it only if grounded (else returns the
+  violations and changes nothing). 409 if there are no accepted bullets.
+- **Advisory council narrative** —
+  `POST /api/packages/{id}/ai-council-narrative`. A plain-language
+  summary of the latest deterministic council run's findings. It is
+  clearly labelled advisory and **does not touch the council flow,
+  verdicts, readiness, or any bullet** — so the heavily-tested
+  deterministic 13-step / 5-agent review is completely unchanged.
+- **Hardened provider** (`ai_provider.py`). Anthropic path now has an
+  env-tunable timeout and a hard `max_tokens` ceiling
+  (`APTIRO_AI_TIMEOUT`, `APTIRO_AI_MAX_TOKENS`); still falls back to the
+  deterministic mock on any misconfiguration. A `_ai_provider()`
+  indirection in `app.py` is the single seam (tests inject stubs here).
+- **Frontend.** A "✦ AI suggest" action on every bullet (loads a
+  grounded suggestion into the editor for review; a blocked suggestion
+  surfaces the violation and is never applied) and a "✦ AI cover
+  letter" action, both clearly labelled as gated.
+- **Tests (`test_app.py`, +13):** the gate blocks fabricated
+  metrics/entities and passes clean rephrases; mock rewrite is
+  deterministic and never auto-applied; a grounded stub applies and
+  keeps `original_text`; **the contract test** — a stub fabricating
+  "$999M … at Initech" is blocked and never written; unlinked bullets
+  can't be grounded; cover letter requires accepted bullets and rejects
+  fabricated drafts; mock is default + deterministic; anthropic-without-
+  key falls back to mock; an AI-rewritten bullet is still subject to the
+  provenance accept-gate (409); council narrative is advisory +
+  deterministic and needs a run; Phase-5 health.
+
+## Changed in `app.py` (surgical, additive only)
+
+- New gate + endpoints only; no existing endpoint or model changed. The
+  council `_C` helper and the deterministic orchestrator are byte-for-
+  byte unchanged. `/api/health` adds an `ai_assist` block;
+  `latest_phase` stays `4` and `phases_shipped` stays `[1,2,3]` **on
+  purpose** (pinned by earlier tests). The `ai_assist` block is the
+  live Phase-5 capability signal.
+
+## Explicitly NOT changed (non-negotiables honored)
+
+- No fabricated content can be stored: the model is never on the trust
+  path; the gate is mandatory and pre-emptive; nothing auto-applies.
+- Mock stays the default; app + full suite run offline with no key.
+- No auto-submit / external submission / network egress beyond the
+  optional, env-gated provider call; no scraping; no CAPTCHA bypass.
+  Provenance colours, claim controls, bullet
+  accept/reject/rewrite/lock, the deterministic council + Axiom block,
+  the export trust gate, Phase 2 scoring + semantic signal, Phase 3
+  immutable tracker snapshot, and Phase 4 per-user isolation are all
+  unchanged.
+
+## Validation
+
+`pytest -q` → **122 passed**. End-to-end with a real résumé: mock
+rewrite is deterministic and not auto-applied; a grounded stub applies
+and preserves the original; a stub fabricating "$999M ARR … at Initech"
+is **blocked with 6 violations and never written**; a fabricated cover-
+letter draft ("$880M at Hooli") is not saved; the council narrative is
+deterministic and leaves readiness untouched; health reports the
+`ai_assist` block with `grounding_gate true`, `auto_apply false`.
+
+---
+
 # CHANGES — Phase 4: Multi-user, auth & data isolation
 
 Phase 4 is **additive and behavior-preserving** via a default-user

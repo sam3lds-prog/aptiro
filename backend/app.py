@@ -1663,7 +1663,11 @@ def health():
             "auth": {"enabled": AUTH_ENABLED,
                      "mode": "multi_user" if AUTH_ENABLED
                      else "single_user_local",
-                     "default_user": DEFAULT_UID}}
+                     "default_user": DEFAULT_UID},
+            "ai_assist": {
+                "provider": ai_provider.active_provider_name(),
+                "grounding_gate": True,
+                "auto_apply": False}}
 
 
 # ===========================================================================
@@ -2263,6 +2267,77 @@ def _unsupported_metrics(session, b):
     return [n for n in nums if n.strip() not in src]
 
 
+# --- Phase 5: provenance verification gate -------------------------------
+# A POST-generation check applied to ANY AI-produced text before it can
+# touch a package. It rejects output that introduces a "hard fact" - a
+# metric, a standalone number, or a proper-noun entity - that is not
+# present in the linked approved claim's grounding. This is the
+# pre-emptive complement to Axiom's existing fabricated-metric block:
+# Axiom catches it during the council; this stops it ever being stored.
+_BARE_NUM = re.compile(r"(?<![A-Za-z0-9])\d[\d,]*(?:\.\d+)?(?![A-Za-z])")
+_PROPER = re.compile(
+    r"\b[A-Z][A-Za-z0-9&.\-]+(?:\s+[A-Z][A-Za-z0-9&.\-]+){0,3}\b")
+_PROPER_STOP = {
+    "i", "the", "a", "an", "and", "or", "but", "led", "drove", "built",
+    "managed", "shipped", "owned", "created", "designed", "delivered",
+    "launched", "improved", "increased", "reduced", "developed",
+    "spearheaded", "this", "that", "these", "those", "we", "my", "our",
+    "responsible", "worked", "helped", "tasked", "for", "with", "to",
+    "of", "in", "on", "by", "as", "at", "team", "teams", "product",
+    "products", "strategy", "platform", "customers", "users",
+}
+
+
+def _grounding_text(session, claim):
+    if claim is None:
+        return ""
+    return " ".join([
+        claim.claim_text or "", " ".join(claim.metrics or []),
+        " ".join(claim.skills or []), claim.company or "",
+        claim.role or "", claim.date_range or ""]).lower()
+
+
+def verify_grounded(session, text, claim):
+    """Return a list of grounding violations for `text` against
+    `claim`. Empty list => every hard fact in the text is present in the
+    claim's evidence (i.e. nothing was fabricated). A bullet with no
+    linked approved claim cannot be grounded at all."""
+    if claim is None:
+        return ["No linked approved claim - AI text cannot be grounded."]
+    src = _grounding_text(session, claim)
+    text = text or ""
+    viol = []
+    seen = set()
+    for m in _extract_metrics(text):
+        key = ("m", m.strip().lower())
+        if m.strip().lower() not in src and key not in seen:
+            seen.add(key)
+            viol.append("metric not in evidence: %s" % m.strip())
+    for num in _BARE_NUM.findall(text):
+        n = num.replace(",", "")
+        if len(n.replace(".", "")) < 2:        # ignore trivial 1-digit
+            continue
+        if (num.lower() in src or n in src.replace(",", "")):
+            continue
+        key = ("n", n)
+        if key not in seen:
+            seen.add(key)
+            viol.append("number not in evidence: %s" % num)
+    for ent in _PROPER.findall(text):
+        el = ent.lower().strip(" .,-")
+        if not el or el in src:
+            continue
+        if all(w in _PROPER_STOP for w in el.split()):
+            continue
+        # only flag entity-ish: multi-word OR all-caps acronym-ish
+        if " " in ent or (ent.isupper() and len(ent) >= 3):
+            key = ("e", el)
+            if key not in seen:
+                seen.add(key)
+                viol.append("entity not in evidence: %s" % ent)
+    return viol
+
+
 def _rank_claims(claims):
     return sorted(
         claims,
@@ -2555,6 +2630,158 @@ def patch_bullet(pkg_id: str, bid: str, body: BulletPatch,
         session.commit()
     session.refresh(b)
     return _bullet_out(session, b)
+
+
+# ---- Phase 5: grounded AI assist ----------------------------------------
+# Optional. Mock is the default and is deterministic/offline, so the
+# whole suite stays green with no key. The real Anthropic path is only
+# used when explicitly configured; EITHER WAY every AI output passes the
+# provenance verification gate before it can touch a package - the model
+# can suggest phrasing, never facts.
+def _ai_provider():
+    """Single indirection so tests can inject a stub provider and so the
+    real/mock choice is resolved per call."""
+    return ai_provider.get_provider()
+
+
+class AIRewriteRequest(BaseModel):
+    instruction: Optional[str] = None
+    apply: bool = False
+
+
+class AIRewriteOut(BaseModel):
+    provider: str
+    suggestion: str
+    grounded: bool
+    violations: List[str]
+    applied: bool
+    original_text: str
+    note: str = ("AI may rephrase only facts already in your approved "
+                 "evidence. Anything it adds that is not in the linked "
+                 "claim is blocked and never stored.")
+
+
+@packages_router.post("/{pkg_id}/bullets/{bid}/ai-rewrite",
+                      response_model=AIRewriteOut)
+def ai_rewrite_bullet(pkg_id: str, bid: str, body: AIRewriteRequest,
+                      session: Session = Depends(get_session)):
+    pkg = _get_owned(session, ApplicationPackage, pkg_id)
+    if not pkg:
+        raise HTTPException(404, "Package not found")
+    b = session.get(PackageBullet, bid)
+    if not b or b.package_id != pkg_id:
+        raise HTTPException(404, "Bullet not found")
+    if b.status == BulletStatus.locked:
+        raise HTTPException(409, "Bullet is locked.")
+    claim = session.get(ProfileClaim, b.claim_id) if b.claim_id else None
+    src = _grounding_text(session, claim)
+    sys = ("You are a careful resume editor. Rewrite the bullet to be "
+           "crisp and outcome-led, but you may ONLY use facts present "
+           "in the EVIDENCE. Do not introduce any company, product, "
+           "metric, number, title, or date that is not in the EVIDENCE. "
+           "Return only the rewritten bullet, one line.")
+    prompt = ("EVIDENCE:\n%s\n\nCURRENT BULLET:\n%s\n\n%s\nRewrite:"
+              % (src or "(none)", b.current_text or "",
+                 (body.instruction or "").strip()))
+    try:
+        prov = _ai_provider()
+        suggestion = (prov.complete(prompt, system=sys,
+                                    max_tokens=300) or "").strip()
+    except Exception as e:
+        raise HTTPException(
+            502, "AI provider error (%s); no change made."
+            % type(e).__name__)
+    violations = verify_grounded(session, suggestion, claim)
+    grounded = not violations
+    applied = False
+    if body.apply and grounded and suggestion:
+        b.original_text = b.original_text or b.current_text
+        b.current_text = suggestion
+        if b.status != BulletStatus.locked:
+            b.status = BulletStatus.rewritten
+        b.updated_at = _now()
+        session.add(b)
+        session.commit()
+        if any(x.section == "cover_letter" for x in pkg.bullets):
+            _recompute_cover_letter(session, pkg)
+            session.commit()
+        applied = True
+    return AIRewriteOut(
+        provider=prov.name, suggestion=suggestion, grounded=grounded,
+        violations=violations, applied=applied,
+        original_text=b.original_text or b.current_text)
+
+
+class AICoverLetterOut(BaseModel):
+    provider: str
+    draft: str
+    grounded: bool
+    violations: List[str]
+    applied: bool
+    note: str = ("Drafted only from your ACCEPTED bullets and gated "
+                 "against their evidence; ungrounded drafts are never "
+                 "saved to the package.")
+
+
+@packages_router.post("/{pkg_id}/ai-cover-letter",
+                      response_model=AICoverLetterOut)
+def ai_cover_letter(pkg_id: str, apply: bool = False,
+                    session: Session = Depends(get_session)):
+    pkg = _get_owned(session, ApplicationPackage, pkg_id)
+    if not pkg:
+        raise HTTPException(404, "Package not found")
+    accepted = [b for b in pkg.bullets
+                if b.section in ("experience", "summary", "skills")
+                and b.status in (BulletStatus.accepted,
+                                 BulletStatus.locked)]
+    if not accepted:
+        raise HTTPException(
+            409, "No accepted bullets to ground a cover letter on. "
+            "Accept some evidence-backed bullets first.")
+    facts = "\n".join("- " + (b.current_text or "") for b in accepted)
+    sys = ("You are a careful cover-letter writer. Use ONLY the facts "
+           "in EVIDENCE. Do not introduce any company, product, metric, "
+           "number, title, or date not present in EVIDENCE. 120 words "
+           "max, professional, no placeholders.")
+    prompt = ("ROLE: %s at %s\n\nEVIDENCE (accepted, evidence-backed "
+              "bullets):\n%s\n\nWrite the cover letter body:"
+              % (pkg.title or "the role", pkg.company or "the company",
+                 facts))
+    try:
+        prov = _ai_provider()
+        draft = (prov.complete(prompt, system=sys,
+                               max_tokens=400) or "").strip()
+    except Exception as e:
+        raise HTTPException(
+            502, "AI provider error (%s); no change made."
+            % type(e).__name__)
+    # Gate the draft against the UNION of the accepted bullets' claims.
+    src_terms = []
+    for b in accepted:
+        c = session.get(ProfileClaim, b.claim_id) if b.claim_id else None
+        src_terms.append(_grounding_text(session, c))
+        src_terms.append((b.current_text or "").lower())
+    union = " ".join(src_terms)
+
+    class _Syn:
+        claim_text = union
+        metrics = []
+        skills = []
+        company = pkg.company or ""
+        role = pkg.title or ""
+        date_range = ""
+    violations = verify_grounded(session, draft, _Syn())
+    grounded = not violations
+    applied = False
+    if apply and grounded and draft:
+        pkg.cover_letter = draft
+        pkg.updated_at = _now()
+        session.add(pkg)
+        session.commit()
+        applied = True
+    return AICoverLetterOut(
+        provider=prov.name, draft=draft, grounded=grounded,
+        violations=violations, applied=applied)
 
 
 # ---- council --------------------------------------------------------------
@@ -2850,6 +3077,45 @@ def list_runs(pkg_id: str, session: Session = Depends(get_session)):
         id=r.id, status=r.status, ready=r.ready, summary=r.summary,
         critique_count=len(r.critiques), created_at=r.started_at)
         for r in rs]
+
+
+class CouncilNarrativeOut(BaseModel):
+    provider: str
+    narrative: str
+    ready: bool
+    note: str = ("Advisory plain-language summary of the deterministic "
+                 "council review. It does not change the verdict, the "
+                 "readiness decision, or any bullet.")
+
+
+@packages_router.post("/{pkg_id}/ai-council-narrative",
+                      response_model=CouncilNarrativeOut)
+def ai_council_narrative(pkg_id: str,
+                         session: Session = Depends(get_session)):
+    pkg = _get_owned(session, ApplicationPackage, pkg_id)
+    if not pkg:
+        raise HTTPException(404, "Package not found")
+    runs = sorted(pkg.runs, key=lambda r: r.started_at, reverse=True)
+    if not runs:
+        raise HTTPException(
+            409, "Run the council first (orchestrate the package).")
+    run = runs[0]
+    lines = ["%s/%s: %s" % (c.agent, c.severity, c.message)
+             for c in run.critiques]
+    sys = ("Summarize this resume-package review for the candidate in "
+           "2-3 plain sentences. Summarize ONLY the findings listed; do "
+           "not invent issues, metrics, or praise not in the list.")
+    prompt = ("READY: %s\nFINDINGS:\n%s\n\nSummary:"
+              % (run.ready, "\n".join(lines) or "(no critiques)"))
+    try:
+        prov = _ai_provider()
+        narrative = (prov.complete(prompt, system=sys,
+                                   max_tokens=250) or "").strip()
+    except Exception as e:
+        raise HTTPException(
+            502, "AI provider error (%s)." % type(e).__name__)
+    return CouncilNarrativeOut(provider=prov.name, narrative=narrative,
+                               ready=run.ready)
 
 
 @runs_router.get("/api/runs/{run_id}", response_model=RunOut)
