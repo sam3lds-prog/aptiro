@@ -82,7 +82,13 @@ ranking order on its own.
 
 ---
 
-## Phase 3 — Application tracker: close the loop (human-in-loop only)
+## Phase 3 — Application tracker: close the loop (human-in-loop only)  ✅ DELIVERED
+
+> Shipped. Test suite 83 → 99. See `CHANGES.md` for the full diff.
+> Audited human-only state machine, immutable SHA-256 submit snapshot,
+> deterministic reminders, ATS-safe export profile, tracker in the
+> privacy bundle (JSON + CSV), and an explicit test proving no code
+> path can submit anything anywhere.
 
 **Why.** You've ingested truthfully, built a package, and exported it.
 The natural next step is tracking what happened to that application —

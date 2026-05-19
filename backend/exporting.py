@@ -250,3 +250,49 @@ def render(model, fmt, artifact="resume"):
     if fmt not in _RENDERERS:
         raise ExportError("Unsupported export format: %s" % fmt)
     return _RENDERERS[fmt](model, artifact)
+
+
+# --------------------------------------------------------------------------
+# Phase 3: ATS-safe profile
+# --------------------------------------------------------------------------
+# A deliberately plain, single-column, ASCII-only plain-text resume.
+# No tables, no columns, no glyphs, no markup - the layout applicant
+# tracking systems parse most reliably. Kept as a separate profile (NOT
+# added to FORMATS) so the existing format contract and tests are
+# unchanged; the app routes `format=ats` here explicitly.
+ATS_PROFILE = "ats"
+
+
+def _ascii(s):
+    repl = {"\u2013": "-", "\u2014": "-", "\u2018": "'", "\u2019": "'",
+            "\u201c": '"', "\u201d": '"', "\u2022": "-", "\u00a0": " ",
+            "\u2026": "...", "\u00b7": "-", "\u25aa": "-", "\u25e6": "-"}
+    for k, v in repl.items():
+        s = s.replace(k, v)
+    return s.encode("ascii", "ignore").decode("ascii")
+
+
+def render_ats(model, artifact="resume"):
+    """Single-column, ASCII, no-table plain text. Returns (bytes,
+    'txt'). Operates on the SAME already-filtered model, so the
+    provenance/exclusion gate still applies."""
+    L = []
+    L.append(_ascii(model.get("title") or "Application"))
+    L.append("Target: %s at %s" % (_ascii(model.get("job_title", "")),
+                                   _ascii(model.get("company", ""))))
+    L.append("")
+    for sec, items in _iter(model, artifact):
+        L.append(_SECTION_TITLES.get(sec, sec.title()).upper())
+        if sec == "cover_letter":
+            for it in items:
+                L.append(_ascii(it["text"]))
+                L.append("")
+        else:
+            for it in items:
+                L.append("- " + _ascii(it["text"]))
+            L.append("")
+    if model.get("excluded") and not model.get("include_unsupported"):
+        L.append("(%d item(s) excluded as unsupported or rejected and "
+                 "intentionally omitted.)" % len(model["excluded"]))
+    out = "\n".join(line.rstrip() for line in L).strip() + "\n"
+    return out.encode("ascii", "ignore"), "txt"

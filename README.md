@@ -1,22 +1,24 @@
-# Aptiro — Trust + Export + Real Job Discovery (Phase 2)
+# Aptiro — Trust + Export + Discovery + Tracker (Phase 3)
 
 Aptiro turns your own résumé/profile into **provenance-tracked claims**,
 discovers real jobs (paste a description or import a public posting URL
 you supply), scores each one with an **explainable, evidence-cited
 breakdown**, builds an application package where **every bullet traces
-back to an approved source**, and exports it — with rejected / unsupported
-content **excluded by default**.
+back to an approved source**, exports it — with rejected / unsupported
+content **excluded by default** — and tracks the application's lifecycle
+**without ever submitting anything for you**.
 
 Nothing is fabricated. Nothing is auto-submitted. No crawling, no
 LinkedIn/auth-walled scraping, no CAPTCHA circumvention.
 
-This build is the **Trust + Export slice (Phase 1)** plus **Phase 2 —
-Real job discovery & explainable matching**: real paste/URL job import
-with structured must-have vs nice-to-have requirements, a per-criterion
-score breakdown that cites the exact evidence claims behind every point,
-and a clearly-labelled *secondary* semantic signal that never affects the
-deterministic score or ranking. Built on the Delivery 1–4 contract
-without rewriting the app.
+This build is **Phase 1 (Trust + Export)** + **Phase 2 (real job
+discovery & explainable matching)** + **Phase 3 (the human-in-loop
+application tracker)**: an audited state machine, an immutable SHA-256
+"what I sent" snapshot frozen the moment *you* mark an application
+submitted, deterministic follow-up reminders, an ATS-safe plain-text
+export profile, and the tracker in the privacy export — with an explicit
+test proving no code path can submit anything anywhere. Built on the
+Delivery 1–4 contract without rewriting the app.
 
 ---
 
@@ -53,7 +55,7 @@ docker compose up --build
 
 ```bash
 cd backend && . .venv/bin/activate
-pytest -q          # 83 tests, all green (63 Phase-1 + 20 Phase-2; 0 removed)
+pytest -q          # 99 tests, all green (63 P1 + 20 P2 + 16 P3; 0 removed)
 ```
 
 Tests are deterministic and offline: in-memory SQLite, mock AI, no network.

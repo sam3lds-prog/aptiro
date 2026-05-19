@@ -1070,3 +1070,215 @@ def test_health_advertises_phase2_capabilities(client):
     assert "url" in h["job_import"] and "paste" in h["job_import"]
     assert h["providers"]["embedding"] == "mock"
     assert h["semantic_signal"]["affects_score"] is False
+
+
+# ===========================================================================
+# Phase 3 - application tracker (close the loop, human-in-loop only)
+# ===========================================================================
+def _package(client):
+    jid = _seed_and_job(client)
+    return client.post("/api/packages", json={"job_id": jid}).json()["id"]
+
+
+def test_create_application_from_package(client):
+    pid = _package(client)
+    r = client.post("/api/applications", json={"package_id": pid,
+                                               "note": "applying"})
+    assert r.status_code == 201
+    a = r.json()
+    assert a["status"] == "drafted"
+    assert a["package_id"] == pid
+    assert a["has_snapshot"] is False
+    assert a["history"] and a["history"][0]["to"] == "drafted"
+    assert any("never submits" in g.lower() for g in a["guarantees"])
+
+
+def test_create_application_bad_package_404(client):
+    assert client.post("/api/applications",
+                       json={"package_id": "nope"}).status_code == 404
+
+
+def test_legal_transition_path(client):
+    pid = _package(client)
+    aid = client.post("/api/applications",
+                      json={"package_id": pid}).json()["id"]
+    for to in ("exported", "submitted_by_user", "interviewing",
+               "offer"):
+        r = client.post(f"/api/applications/{aid}/transition",
+                        json={"to": to})
+        assert r.status_code == 200, (to, r.json())
+        assert r.json()["status"] == to
+    hist = client.get(f"/api/applications/{aid}").json()["history"]
+    assert [h["to"] for h in hist] == ["drafted", "exported",
+                                       "submitted_by_user",
+                                       "interviewing", "offer"]
+
+
+def test_illegal_transition_returns_409(client):
+    pid = _package(client)
+    aid = client.post("/api/applications",
+                      json={"package_id": pid}).json()["id"]
+    # drafted -> offer is not allowed
+    r = client.post(f"/api/applications/{aid}/transition",
+                    json={"to": "offer"})
+    assert r.status_code == 409
+    assert "illegal transition" in r.json()["detail"].lower()
+    # state unchanged after the rejected transition
+    assert client.get(
+        f"/api/applications/{aid}").json()["status"] == "drafted"
+
+
+def test_terminal_states_reject_further_transitions(client):
+    pid = _package(client)
+    aid = client.post("/api/applications",
+                      json={"package_id": pid}).json()["id"]
+    client.post(f"/api/applications/{aid}/transition",
+                json={"to": "withdrawn"})
+    r = client.post(f"/api/applications/{aid}/transition",
+                    json={"to": "exported"})
+    assert r.status_code == 409
+
+
+def test_submit_freezes_immutable_snapshot(client):
+    pid = _package(client)
+    aid = client.post("/api/applications",
+                      json={"package_id": pid}).json()["id"]
+    client.post(f"/api/applications/{aid}/transition",
+                json={"to": "exported"})
+    client.post(f"/api/applications/{aid}/transition",
+                json={"to": "submitted_by_user"})
+    snap1 = client.get(f"/api/applications/{aid}/snapshot").json()
+    sha1 = snap1["snapshot_sha"]
+    assert sha1 and snap1["snapshot"]["export_model"]["sections"]
+    # advancing further must NOT rewrite the frozen snapshot
+    client.post(f"/api/applications/{aid}/transition",
+                json={"to": "interviewing"})
+    snap2 = client.get(f"/api/applications/{aid}/snapshot").json()
+    assert snap2["snapshot_sha"] == sha1
+    assert snap2["snapshot"] == snap1["snapshot"]
+    a = client.get(f"/api/applications/{aid}").json()
+    assert a["snapshot_sha"] == sha1 and a["submitted_at"]
+
+
+def test_snapshot_404_before_submit(client):
+    pid = _package(client)
+    aid = client.post("/api/applications",
+                      json={"package_id": pid}).json()["id"]
+    assert client.get(
+        f"/api/applications/{aid}/snapshot").status_code == 404
+
+
+def test_reminders_are_deterministic_and_offline():
+    from datetime import datetime, timezone
+    import app as _A
+    t = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    r1 = _A._make_reminders(t)
+    r2 = _A._make_reminders(t)
+    assert r1 == r2
+    assert [x["offset_days"] for x in r1] == [3, 7, 14]
+    assert all(x["done"] is False for x in r1)
+
+
+def test_reminders_attached_on_submit_and_completable(client):
+    pid = _package(client)
+    aid = client.post("/api/applications",
+                      json={"package_id": pid}).json()["id"]
+    client.post(f"/api/applications/{aid}/transition",
+                json={"to": "exported"})
+    a = client.post(f"/api/applications/{aid}/transition",
+                    json={"to": "submitted_by_user"}).json()
+    assert len(a["reminders"]) == 3
+    rid = a["reminders"][0]["id"]
+    done = client.post(
+        f"/api/applications/{aid}/reminders/{rid}/done").json()
+    assert next(r for r in done["reminders"]
+                if r["id"] == rid)["done"] is True
+
+
+def test_tracker_in_privacy_export_json(client):
+    pid = _package(client)
+    client.post("/api/applications", json={"package_id": pid})
+    bundle = client.get("/api/privacy/export").json()
+    assert "application" in bundle["data"]
+    assert bundle["counts"]["application"] == 1
+
+
+def test_tracker_csv_export(client):
+    pid = _package(client)
+    aid = client.post("/api/applications",
+                      json={"package_id": pid}).json()["id"]
+    client.post(f"/api/applications/{aid}/transition",
+                json={"to": "withdrawn"})
+    r = client.get("/api/applications/export.csv")
+    assert r.status_code == 200
+    assert "text/csv" in r.headers["content-type"]
+    body = r.text
+    assert "company,job_title,status" in body
+    assert "withdrawn" in body
+
+
+def test_no_outbound_submission_path_exists():
+    """The tracker must never POST an application anywhere. Assert no
+    network/mail egress symbol appears anywhere in the tracker code.
+    (Route-decorator '.post' is stripped first; it is inbound routing,
+    not egress.)"""
+    import inspect
+    import re as _re
+    import app as _A
+    raw = (inspect.getsource(_A.transition_application)
+           + inspect.getsource(_A._app_snapshot)
+           + inspect.getsource(_A._make_reminders)
+           + inspect.getsource(_A.create_application)
+           + inspect.getsource(_A.complete_reminder))
+    # drop FastAPI route-decorator lines (inbound, not egress)
+    src = "\n".join(ln for ln in raw.splitlines()
+                    if not _re.match(r"\s*@applications_router\.", ln))
+    for forbidden in ("requests.", "httpx.", "urlopen(", "smtplib",
+                      "socket(", "fetch_url_text("):
+        assert forbidden not in src, \
+            f"tracker must not reference {forbidden}"
+
+
+def test_submit_makes_no_network_call(client, monkeypatch):
+    import app as _A
+
+    class _Boom:
+        def __getattr__(self, _):
+            raise AssertionError("tracker attempted network egress")
+    monkeypatch.setattr(_A, "_httpx", _Boom())
+    pid = _package(client)
+    aid = client.post("/api/applications",
+                      json={"package_id": pid}).json()["id"]
+    client.post(f"/api/applications/{aid}/transition",
+                json={"to": "exported"})
+    r = client.post(f"/api/applications/{aid}/transition",
+                    json={"to": "submitted_by_user"})
+    assert r.status_code == 200
+    assert r.json()["snapshot_sha"]
+
+
+def test_ats_export_is_plain_single_column_ascii(client):
+    pid = _package(client)
+    r = client.get(f"/api/packages/{pid}/export?format=ats&artifact=both")
+    assert r.status_code == 200
+    assert "text/plain" in r.headers["content-type"]
+    body = r.content
+    body.decode("ascii")                     # must be pure ASCII
+    assert b"<" not in body and b"|" not in body   # no HTML, no tables
+    assert b"EXPERIENCE" in body or b"SUMMARY" in body
+    # respects the same exclusion gate as every other export
+    assert b"\xe2\x80\x94" not in body       # no em-dash bytes
+
+
+def test_ats_profile_does_not_change_format_contract(client):
+    h = client.get("/api/health").json()
+    assert h["export_formats"] == ["md", "html", "docx", "pdf"]
+    assert "ats" in h["export_profiles"]
+
+
+def test_health_advertises_phase3(client):
+    h = client.get("/api/health").json()
+    assert h["phase"] == 2                         # pinned, unchanged
+    assert h["phases_shipped"] == [1, 2, 3]
+    assert h["application_tracker"]["auto_submit"] is False
+    assert h["application_tracker"]["immutable_snapshot"] is True

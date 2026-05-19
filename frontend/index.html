@@ -659,6 +659,7 @@ function Packages({notify}){
               <option value="html">HTML</option>
               <option value="docx">DOCX (Word)</option>
               <option value="pdf">PDF</option>
+              <option value="ats">ATS-safe (plain text)</option>
             </select></div>
           <div><label className="f">Artifact</label>
             <select value={exArt} onChange={e=>setExArt(e.target.value)}>
@@ -677,6 +678,13 @@ function Packages({notify}){
           <button className="btn" onClick={doExport}>
             Download {exArt} · {exFmt.toUpperCase()}</button>
           <button className="btn sec" onClick={loadPreview}>Preview gate</button>
+          <button className="btn sec" onClick={async()=>{
+            try{ const a=await api("/applications",{method:"POST",
+              body:JSON.stringify({package_id:sel})});
+              notify("Tracking started — see the Tracker tab (status: "
+                +a.status+"). Aptiro never submits for you.");
+            }catch(e){ notify(e.message); } }}>
+            Track this application</button>
         </div>
         {!exInc && <div className="note">
           Rejected, do-not-use, red, and unsupported-metric content is
@@ -821,16 +829,102 @@ function Privacy({notify}){
 }
 
 /* ---------------- Shell ---------------- */
+function Tracker({notify}){
+  const [apps,setApps]=useState([]); const [open,setOpen]=useState(null);
+  const [snap,setSnap]=useState(null);
+  const refresh=async()=>{ try{ setApps(await api("/applications")); }
+    catch(e){ notify(e.message); } };
+  useEffect(()=>{ refresh(); },[]);
+  async function move(id,to){
+    try{ await api("/applications/"+id+"/transition",
+      {method:"POST",body:JSON.stringify({to})});
+      notify("Status → "+to+" (recorded in history)"); refresh();
+      if(open===id) viewSnap(id);
+    }catch(e){ notify(e.status===409?
+      "That transition isn't allowed from the current status.":e.message); }
+  }
+  async function viewSnap(id){
+    setOpen(id);
+    try{ setSnap(await api("/applications/"+id+"/snapshot")); }
+    catch(e){ setSnap(null); }
+  }
+  async function reminderDone(id,rid){
+    try{ await api("/applications/"+id+"/reminders/"+rid+"/done",
+      {method:"POST"}); notify("Reminder marked done"); refresh();
+    }catch(e){ notify(e.message); }
+  }
+  const SC={drafted:"var(--sub)",exported:"var(--accent)",
+    submitted_by_user:"var(--green)",interviewing:"var(--orange)",
+    offer:"var(--green)",rejected:"var(--red)",withdrawn:"var(--sub)"};
+  return <div>
+    <h1>Application Tracker</h1>
+    <p className="sub">Track applications you submit yourself. Aptiro
+      <b> never submits anything for you</b> — “submitted” is a status
+      you set after applying on the employer’s own site. The moment you
+      mark it submitted, an immutable snapshot of exactly what you sent
+      is frozen as evidence.</p>
+    {!apps.length && <p className="sub">No applications tracked yet —
+      open a package and click “Track this application”.</p>}
+    {apps.map(a=>
+      <div className="card" key={a.id}>
+        <div className="row" style={{justifyContent:"space-between"}}>
+          <b>{a.job_title} — {a.company}</b>
+          <span className="pill" style={{background:SC[a.status]||
+            "var(--sub)"}}>{a.status.replace(/_/g," ")}</span>
+        </div>
+        <div className="row" style={{marginTop:8,flexWrap:"wrap"}}>
+          {a.allowed_transitions.map(t=>
+            <button key={t} className="btn ghost mini"
+              onClick={()=>move(a.id,t)}>→ {t.replace(/_/g," ")}</button>)}
+          {!a.allowed_transitions.length &&
+            <span className="sub" style={{fontSize:12}}>terminal state</span>}
+          <button className="btn ghost mini"
+            onClick={()=>viewSnap(a.id)}>Snapshot &amp; history</button>
+        </div>
+        {!!(a.reminders||[]).length && <div style={{marginTop:8}}>
+          {a.reminders.map(r=>
+            <div key={r.id} className="kv" style={{border:0,
+              opacity:r.done?.5:1}}>
+              <span style={{fontSize:12}}>
+                {r.done?"✓ ":"○ "}{r.message} ({r.offset_days}d)</span>
+              {!r.done && <button className="btn ghost mini"
+                onClick={()=>reminderDone(a.id,r.id)}>done</button>}
+            </div>)}
+        </div>}
+        {open===a.id && <div style={{marginTop:10}}>
+          <div className="f">History (audit log)</div>
+          {(a.history||[]).map((h,i)=>
+            <div key={i} className="snip" style={{fontSize:11.5}}>
+              {(h.from||"·")} → {h.to}{h.note?" — "+h.note:""} ·{" "}
+              {new Date(h.at).toLocaleString()}</div>)}
+          {snap && snap.snapshot ? <div className="note"
+            style={{marginTop:8}}>
+            <b>Immutable snapshot</b> · sha {snap.snapshot_sha.slice(0,16)}…
+            <div style={{fontSize:11.5,marginTop:4}}>
+              Frozen {new Date(snap.snapshot.frozen_at).toLocaleString()};
+              {" "}{Object.values(snap.snapshot.export_model.sections||{})
+                .reduce((n,s)=>n+s.length,0)} line(s) of provenance-checked
+              content captured exactly as sent.</div></div>
+            : <div className="sub" style={{fontSize:12,marginTop:8}}>
+              No snapshot yet — frozen only when you mark it submitted.</div>}
+        </div>}
+      </div>)}
+  </div>;
+}
+
+
 function App(){
   const [tab,setTab]=useState("dash");
   const [toast,setToast]=useState(null);
   const notify=(m)=>{ setToast(m); setTimeout(()=>setToast(null),4200); };
   const T={dash:Dashboard,vault:Vault,strategy:Strategy,jobs:Jobs,
-    matches:Matches,packages:Packages,apply:Apply,privacy:Privacy};
+    matches:Matches,packages:Packages,tracker:Tracker,apply:Apply,
+    privacy:Privacy};
   const View=T[tab];
   const NAV=[["dash","Dashboard"],["vault","Profile Vault"],
     ["strategy","Strategy"],["jobs","Jobs"],["matches","Matches"],
-    ["packages","Packages"],["apply","Apply"],["privacy","Privacy"]];
+    ["packages","Packages"],["tracker","Tracker"],["apply","Apply"],
+    ["privacy","Privacy"]];
   return <div className="app">
     <div className="nav">
       <div className="brand">APTIRO

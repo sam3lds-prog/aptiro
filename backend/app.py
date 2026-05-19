@@ -213,6 +213,20 @@ class NotificationChannel(str, Enum):
     in_app = "in_app"
 
 
+class ApplicationStatus(str, Enum):
+    """Phase 3 tracker lifecycle. Every transition is human-initiated
+    and audited; the app NEVER submits anything anywhere -
+    'submitted_by_user' is a state the USER asserts after they applied
+    on the employer's own site."""
+    drafted = "drafted"
+    exported = "exported"
+    submitted_by_user = "submitted_by_user"
+    interviewing = "interviewing"
+    offer = "offer"
+    rejected = "rejected"
+    withdrawn = "withdrawn"
+
+
 # ===========================================================================
 # Models
 # ===========================================================================
@@ -408,6 +422,34 @@ class NotificationPreview(SQLModel, table=True):
     package_id: Optional[str] = None
     status: str = "preview"
     created_at: datetime = Field(default_factory=_now)
+
+
+class Application(SQLModel, table=True):
+    """Phase 3: the post-submission tracker. Created from a package by
+    an explicit human action; tracks the real-world lifecycle WITHOUT
+    ever submitting anything. The `snapshot` is frozen the moment the
+    user marks it submitted and is never rewritten - it is immutable
+    evidence of exactly what was sent."""
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    package_id: str = Field(foreign_key="applicationpackage.id",
+                            index=True)
+    job_id: str = ""
+    job_title: str = ""
+    company: str = ""
+    status: ApplicationStatus = ApplicationStatus.drafted
+    note: Optional[str] = None
+    submitted_at: Optional[datetime] = None
+    # Immutable "what I sent" evidence (set once, at submit).
+    snapshot: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    snapshot_sha: Optional[str] = None
+    # Audit log of every human-initiated transition.
+    history: List[dict] = Field(default_factory=list,
+                                sa_column=Column(JSON))
+    # Deterministic follow-up reminders (no scheduler, never sent).
+    reminders: List[dict] = Field(default_factory=list,
+                                  sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
 
 
 _connect_args = {"check_same_thread": False} if _IS_SQLITE else {}
@@ -1416,6 +1458,7 @@ app.include_router(jobs_router)
 def health():
     return {"status": "ok", "app": "Aptiro", "delivery": 4,
             "slice": "trust-export", "phase": 2,
+            "phases_shipped": [1, 2, 3],
             "providers": {"ai": AI_PROVIDER, "job": JOB_PROVIDER,
                           "search": SEARCH_PROVIDER,
                           "notification": NOTIFICATION_PROVIDER,
@@ -1423,10 +1466,14 @@ def health():
                               embeddings.active_embedding_provider_name()},
             "ingestion_formats": sorted(ingestion.SUPPORTED),
             "export_formats": exporting.FORMATS,
+            "export_profiles": [exporting.ATS_PROFILE],
             "job_import": ["paste", "url"],
             "semantic_signal": {
                 "provider": embeddings.active_embedding_provider_name(),
-                "affects_score": False}}
+                "affects_score": False},
+            "application_tracker": {
+                "enabled": True, "auto_submit": False,
+                "immutable_snapshot": True}}
 
 
 # ===========================================================================
@@ -2719,13 +2766,23 @@ def export_package(pkg_id: str,
     pkg = session.get(ApplicationPackage, pkg_id)
     if not pkg:
         raise HTTPException(404, "Package not found")
-    if format not in exporting.FORMATS:
-        raise HTTPException(
-            400, "Unsupported format. Choose one of: %s"
-            % ", ".join(exporting.FORMATS))
     if artifact not in ("resume", "cover_letter", "both"):
         raise HTTPException(400, "artifact must be resume|cover_letter|both")
     model = _export_model(session, pkg, include_unsupported)
+    if format == exporting.ATS_PROFILE:
+        content, ext = exporting.render_ats(model, artifact)
+        safe = re.sub(r"[^A-Za-z0-9]+", "_",
+                      "%s_%s_ats" % (pkg.company or "aptiro",
+                                     artifact)).strip("_")
+        return Response(
+            content=content, media_type="text/plain; charset=us-ascii",
+            headers={"Content-Disposition":
+                     'attachment; filename="%s.%s"'
+                     % (safe or "aptiro_package", ext)})
+    if format not in exporting.FORMATS:
+        raise HTTPException(
+            400, "Unsupported format. Choose one of: %s (or 'ats')"
+            % ", ".join(exporting.FORMATS))
     try:
         content, ext = exporting.render(model, format, artifact)
     except exporting.ExportUnavailable as e:
@@ -3096,9 +3153,9 @@ def _all_models():
     global _ALL_MODELS
     if _ALL_MODELS is None:
         _ALL_MODELS = [
-            ApplySession, NotificationPreview, AgentCritique, AgentRun,
-            PackageBullet, ApplicationPackage, SourceRef, ProfileClaim,
-            JobPosting, Strategy, Source,
+            Application, ApplySession, NotificationPreview, AgentCritique,
+            AgentRun, PackageBullet, ApplicationPackage, SourceRef,
+            ProfileClaim, JobPosting, Strategy, Source,
         ]
     return _ALL_MODELS
 
@@ -3181,3 +3238,302 @@ app.include_router(notif_router)
 app.include_router(apply_router)
 app.include_router(privacy_router)
 app.include_router(onboarding_router)
+
+
+# ===========================================================================
+# Phase 3 - application tracker (close the loop, human-in-loop ONLY)
+# ===========================================================================
+# This module NEVER submits an application anywhere. There is no network
+# egress in any tracker code path. `submitted_by_user` is a state the
+# USER asserts after they applied on the employer's own site. Every
+# transition is explicit and audit-logged; the submit snapshot is frozen
+# once and never rewritten.
+
+applications_router = APIRouter(prefix="/api/applications",
+                                tags=["applications"])
+
+# Legal, human-initiated transitions. Anything not listed -> HTTP 409.
+_APP_TRANSITIONS = {
+    ApplicationStatus.drafted: {ApplicationStatus.exported,
+                                ApplicationStatus.withdrawn},
+    ApplicationStatus.exported: {ApplicationStatus.submitted_by_user,
+                                 ApplicationStatus.withdrawn},
+    ApplicationStatus.submitted_by_user: {ApplicationStatus.interviewing,
+                                          ApplicationStatus.rejected,
+                                          ApplicationStatus.withdrawn},
+    ApplicationStatus.interviewing: {ApplicationStatus.offer,
+                                     ApplicationStatus.rejected,
+                                     ApplicationStatus.withdrawn},
+    ApplicationStatus.offer: {ApplicationStatus.rejected,
+                              ApplicationStatus.withdrawn},
+    ApplicationStatus.rejected: set(),     # terminal
+    ApplicationStatus.withdrawn: set(),    # terminal
+}
+
+# Deterministic follow-up cadence (days after the user-asserted submit).
+_REMINDER_PLAN = [
+    (3, "follow_up", "No reply yet? A brief, polite follow-up is "
+     "reasonable now."),
+    (7, "follow_up", "One week in - a second short nudge to the "
+     "recruiter is appropriate."),
+    (14, "status_check", "Two weeks in - consider this cold and shift "
+     "focus to fresher matches."),
+]
+
+
+def _make_reminders(submitted_at):
+    """Pure + deterministic: same submitted_at -> identical reminders.
+    No scheduler, nothing is ever sent; these are advisory rows."""
+    from datetime import timedelta
+    out = []
+    for days, kind, msg in _REMINDER_PLAN:
+        out.append({
+            "id": "rem_%d" % days,
+            "due_at": (submitted_at + timedelta(days=days)).isoformat(),
+            "offset_days": days, "kind": kind, "message": msg,
+            "done": False,
+        })
+    return out
+
+
+def _app_snapshot(session, app_obj):
+    """Freeze EXACTLY what the user is about to send: the same
+    provenance-filtered export model used by /export, plus the cover
+    letter, plus a content hash for tamper-evidence."""
+    import hashlib
+    import json as _json
+    pkg = session.get(ApplicationPackage, app_obj.package_id)
+    model = _export_model(session, pkg) if pkg else {}
+    snap = {
+        "frozen_at": _now().isoformat(),
+        "package_id": app_obj.package_id,
+        "title": pkg.title if pkg else app_obj.job_title,
+        "company": pkg.company if pkg else app_obj.company,
+        "score_snapshot": pkg.score_snapshot if pkg else 0,
+        "cover_letter": pkg.cover_letter if pkg else "",
+        "export_model": model,
+    }
+    blob = _json.dumps(snap, sort_keys=True, default=str).encode()
+    snap_sha = hashlib.sha256(blob).hexdigest()
+    return snap, snap_sha
+
+
+def _app_hist(app_obj, frm, to, note):
+    h = list(app_obj.history or [])
+    h.append({"from": frm.value if frm else None, "to": to.value,
+              "note": note or "", "at": _now().isoformat()})
+    app_obj.history = h
+
+
+class ReminderOut(BaseModel):
+    id: str
+    due_at: str
+    offset_days: int
+    kind: str
+    message: str
+    done: bool
+
+
+class ApplicationCreate(BaseModel):
+    package_id: str
+    note: Optional[str] = None
+
+
+class ApplicationTransition(BaseModel):
+    to: ApplicationStatus
+    note: Optional[str] = None
+
+
+class ApplicationOut(BaseModel):
+    id: str
+    package_id: str
+    job_id: str
+    job_title: str
+    company: str
+    status: ApplicationStatus
+    note: Optional[str]
+    submitted_at: Optional[datetime]
+    snapshot_sha: Optional[str]
+    has_snapshot: bool
+    allowed_transitions: List[str]
+    history: List[dict]
+    reminders: List[ReminderOut]
+    created_at: datetime
+    updated_at: datetime
+    # Reaffirmed every response: nothing is auto-submitted.
+    guarantees: List[str] = [
+        "Aptiro never submits this application anywhere.",
+        "'submitted_by_user' is a state you assert after applying on "
+        "the employer's own site.",
+        "The submit snapshot is frozen once and never rewritten.",
+        "Every status change is explicit and recorded in history.",
+    ]
+
+
+def _app_out(a):
+    return ApplicationOut(
+        id=a.id, package_id=a.package_id, job_id=a.job_id,
+        job_title=a.job_title, company=a.company, status=a.status,
+        note=a.note, submitted_at=a.submitted_at,
+        snapshot_sha=a.snapshot_sha, has_snapshot=bool(a.snapshot),
+        allowed_transitions=sorted(
+            s.value for s in _APP_TRANSITIONS.get(a.status, set())),
+        history=a.history or [],
+        reminders=[ReminderOut(**r) for r in (a.reminders or [])],
+        created_at=a.created_at, updated_at=a.updated_at)
+
+
+@applications_router.post("", response_model=ApplicationOut,
+                          status_code=201)
+def create_application(body: ApplicationCreate,
+                       session: Session = Depends(get_session)):
+    pkg = session.get(ApplicationPackage, body.package_id)
+    if not pkg:
+        raise HTTPException(404, "Package not found")
+    job = session.get(JobPosting, pkg.job_id)
+    a = Application(
+        package_id=pkg.id, job_id=pkg.job_id,
+        job_title=pkg.title or (job.title if job else ""),
+        company=pkg.company or (job.company if job else ""),
+        status=ApplicationStatus.drafted, note=body.note)
+    _app_hist(a, None, ApplicationStatus.drafted,
+              "Tracker created from package (human action).")
+    session.add(a)
+    session.commit()
+    session.refresh(a)
+    return _app_out(a)
+
+
+@applications_router.get("", response_model=List[ApplicationOut])
+def list_applications(session: Session = Depends(get_session)):
+    rows = session.exec(select(Application).order_by(
+        Application.created_at.desc())).all()
+    return [_app_out(a) for a in rows]
+
+
+@applications_router.get("/export.csv")
+def export_applications_csv(session: Session = Depends(get_session)):
+    import csv
+    import io as _io
+    rows = session.exec(select(Application).order_by(
+        Application.created_at)).all()
+    buf = _io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "company", "job_title", "status", "submitted_at",
+                "snapshot_sha", "created_at", "updated_at"])
+    for a in rows:
+        w.writerow([a.id, a.company, a.job_title, a.status.value,
+                    a.submitted_at.isoformat() if a.submitted_at else "",
+                    a.snapshot_sha or "", a.created_at.isoformat(),
+                    a.updated_at.isoformat()])
+    return Response(
+        content=buf.getvalue(), media_type="text/csv",
+        headers={"Content-Disposition":
+                 'attachment; filename="aptiro_applications.csv"'})
+
+
+@applications_router.get("/{app_id}", response_model=ApplicationOut)
+def get_application(app_id: str,
+                    session: Session = Depends(get_session)):
+    a = session.get(Application, app_id)
+    if not a:
+        raise HTTPException(404, "Application not found")
+    return _app_out(a)
+
+
+@applications_router.get("/{app_id}/snapshot")
+def get_application_snapshot(app_id: str,
+                             session: Session = Depends(get_session)):
+    a = session.get(Application, app_id)
+    if not a:
+        raise HTTPException(404, "Application not found")
+    if not a.snapshot:
+        raise HTTPException(
+            404, "No snapshot yet - it is frozen only when you mark the "
+            "application submitted_by_user.")
+    return {"snapshot_sha": a.snapshot_sha, "snapshot": a.snapshot}
+
+
+@applications_router.post("/{app_id}/transition",
+                          response_model=ApplicationOut)
+def transition_application(app_id: str, body: ApplicationTransition,
+                           session: Session = Depends(get_session)):
+    a = session.get(Application, app_id)
+    if not a:
+        raise HTTPException(404, "Application not found")
+    target = body.to
+    allowed = _APP_TRANSITIONS.get(a.status, set())
+    if target not in allowed:
+        raise HTTPException(
+            409, "Illegal transition %s -> %s. Allowed from %s: %s."
+            % (a.status.value, target.value, a.status.value,
+               ", ".join(sorted(s.value for s in allowed)) or "(none)"))
+    frm = a.status
+    # Freeze the immutable evidence snapshot exactly once, at submit.
+    if target == ApplicationStatus.submitted_by_user and not a.snapshot:
+        snap, sha = _app_snapshot(session, a)
+        a.snapshot = snap
+        a.snapshot_sha = sha
+        a.submitted_at = _now()
+        a.reminders = _make_reminders(a.submitted_at)
+        # Advisory preview row (mock provider, never sent).
+        try:
+            _persist_previews(
+                session, NotificationKind.daily_digest,
+                ("Application submitted: %s" % a.company,
+                 "You marked '%s @ %s' submitted. Snapshot frozen "
+                 "(sha %s...). %d follow-up reminders scheduled. "
+                 "[preview - not sent]"
+                 % (a.job_title, a.company, (sha or "")[:8],
+                    len(a.reminders))),
+                package_id=a.package_id,
+                only=NotificationChannel.in_app)
+        except Exception:
+            pass
+    a.status = target
+    a.updated_at = _now()
+    _app_hist(a, frm, target, body.note)
+    session.add(a)
+    session.commit()
+    session.refresh(a)
+    return _app_out(a)
+
+
+@applications_router.post("/{app_id}/reminders/{rem_id}/done",
+                          response_model=ApplicationOut)
+def complete_reminder(app_id: str, rem_id: str,
+                      session: Session = Depends(get_session)):
+    import copy
+    a = session.get(Application, app_id)
+    if not a:
+        raise HTTPException(404, "Application not found")
+    # Deep-copy so the reassignment is a genuinely new object tree;
+    # SQLAlchemy does not track in-place JSON mutations.
+    rems = copy.deepcopy(a.reminders or [])
+    hit = False
+    for r in rems:
+        if r["id"] == rem_id:
+            r["done"] = True
+            hit = True
+    if not hit:
+        raise HTTPException(404, "Reminder not found")
+    a.reminders = rems
+    a.updated_at = _now()
+    session.add(a)
+    session.commit()
+    session.refresh(a)
+    return _app_out(a)
+
+
+@applications_router.delete("/{app_id}", status_code=204)
+def delete_application(app_id: str,
+                       session: Session = Depends(get_session)):
+    a = session.get(Application, app_id)
+    if not a:
+        raise HTTPException(404, "Application not found")
+    session.delete(a)
+    session.commit()
+    return Response(status_code=204)
+
+
+app.include_router(applications_router)
