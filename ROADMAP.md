@@ -190,7 +190,14 @@ AI-touched bullets remain provenance-coloured and gate-checked.
 
 ---
 
-## Phase 6 — Production operations & observability
+## Phase 6 — Production operations & observability  ✅ DELIVERED (roadmap complete)
+
+> Shipped. Test suite 122 → 136. See `CHANGES.md` for the full diff.
+> Structured JSON logging + request IDs, append-only owner-scoped audit
+> trail, `/healthz` + `/readyz`, fail-fast config validation, GitHub
+> Actions CI, hardened non-root container with healthcheck. All
+> additive — no existing behavior changed. **Phases 1–6 are now all
+> delivered.**
 
 **Why.** Hardening for a real deployment, and the finalizer that also
 back-fills the few infra niceties skipped so far (e.g. the Alembic

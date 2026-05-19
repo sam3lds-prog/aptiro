@@ -873,6 +873,29 @@ function Privacy({notify}){
 }
 
 /* ---------------- Shell ---------------- */
+function Activity({notify}){
+  const [rows,setRows]=useState([]);
+  useEffect(()=>{ (async()=>{
+    try{ setRows(await api("/audit?limit=200")); }
+    catch(e){ notify(e.message); } })(); },[]);
+  return <div>
+    <h1>Activity</h1>
+    <p className="sub">Append-only audit trail of every change you made,
+      written by the server (not by the UI), with a request id for
+      correlation. It is intentionally excluded from the privacy export
+      so the trail stays tamper-resistant.</p>
+    {!rows.length && <p className="sub">No activity yet.</p>}
+    {rows.map(e=>
+      <div key={e.id} className="kv" style={{fontSize:12.5}}>
+        <span><b>{e.method}</b> {e.path}</span>
+        <span style={{color:"var(--sub)"}}>{e.status} ·{" "}
+          {e.duration_ms}ms · {new Date(e.at).toLocaleString()} ·{" "}
+          <code>{e.request_id}</code></span>
+      </div>)}
+  </div>;
+}
+
+
 function Tracker({notify}){
   const [apps,setApps]=useState([]); const [open,setOpen]=useState(null);
   const [snap,setSnap]=useState(null);
@@ -1024,12 +1047,12 @@ function App(){
     onAuthed={(u)=>{ setMe(u); setBoot("ready"); }}/>;
   const T={dash:Dashboard,vault:Vault,strategy:Strategy,jobs:Jobs,
     matches:Matches,packages:Packages,tracker:Tracker,apply:Apply,
-    privacy:Privacy};
+    activity:Activity,privacy:Privacy};
   const View=T[tab];
   const NAV=[["dash","Dashboard"],["vault","Profile Vault"],
     ["strategy","Strategy"],["jobs","Jobs"],["matches","Matches"],
     ["packages","Packages"],["tracker","Tracker"],["apply","Apply"],
-    ["privacy","Privacy"]];
+    ["activity","Activity"],["privacy","Privacy"]];
   return <div className="app">
     <div className="nav">
       <div className="brand">APTIRO

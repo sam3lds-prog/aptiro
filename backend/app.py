@@ -101,6 +101,78 @@ _CURRENT_UID = ContextVar("aptiro_uid", default=DEFAULT_UID)
 
 def _uid():
     return _CURRENT_UID.get()
+
+
+# --- Phase 6: ops & observability ----------------------------------------
+import json as _json
+import logging as _logging
+import time as _time
+import uuid as _uuidmod
+
+_REQUEST_ID = ContextVar("aptiro_rid", default="-")
+
+
+def _rid():
+    return _REQUEST_ID.get()
+
+
+_log = _logging.getLogger("aptiro")
+if not _log.handlers:
+    _h = _logging.StreamHandler(_sys.stdout)
+    _h.setFormatter(_logging.Formatter("%(message)s"))
+    _log.addHandler(_h)
+    _log.setLevel(os.getenv("APTIRO_LOG_LEVEL", "INFO").upper())
+    _log.propagate = False
+
+
+def _logj(event, **fields):
+    """One structured JSON line per event. Never raises."""
+    try:
+        rec = {"ts": _now().isoformat(), "event": event,
+               "request_id": _rid()}
+        rec.update(fields)
+        _log.info(_json.dumps(rec, default=str))
+    except Exception:
+        pass
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+def validate_config():
+    """Fail fast on genuinely invalid configuration with a clear
+    message. Defaults are always valid, so normal startup and the test
+    suite are unaffected; only explicitly bad env trips this."""
+    problems = []
+    if not (DATABASE_URL or "").strip():
+        problems.append("APTIRO_DATABASE_URL is empty")
+    a = os.getenv("APTIRO_AUTH", "off").lower()
+    if a not in ("on", "off", "1", "0", "true", "false"):
+        problems.append("APTIRO_AUTH must be on/off (got %r)" % a)
+    for name, raw in (
+            ("APTIRO_URL_FETCH_TIMEOUT",
+             os.getenv("APTIRO_URL_FETCH_TIMEOUT")),
+            ("APTIRO_URL_FETCH_MAX_BYTES",
+             os.getenv("APTIRO_URL_FETCH_MAX_BYTES")),
+            ("APTIRO_AI_MAX_TOKENS", os.getenv("APTIRO_AI_MAX_TOKENS")),
+            ("APTIRO_AI_TIMEOUT", os.getenv("APTIRO_AI_TIMEOUT"))):
+        if raw is None:
+            continue
+        try:
+            if float(raw) <= 0:
+                problems.append("%s must be > 0 (got %r)" % (name, raw))
+        except (TypeError, ValueError):
+            problems.append("%s must be numeric (got %r)" % (name, raw))
+    if os.getenv("APTIRO_AI_PROVIDER", "mock").lower() == "anthropic" \
+            and not os.getenv("ANTHROPIC_API_KEY"):
+        # not fatal: provider falls back to mock, but make it loud
+        _logj("config.warning",
+              message="APTIRO_AI_PROVIDER=anthropic but ANTHROPIC_API_"
+                      "KEY is unset; falling back to the mock provider")
+    if problems:
+        raise ConfigError("Invalid configuration: " + "; ".join(problems))
+    return True
 # URL import guardrails (server-side fetch of a user-supplied public URL
 # only - never a crawler). All overridable via APTIRO_-prefixed env.
 URL_FETCH_TIMEOUT = float(os.getenv("APTIRO_URL_FETCH_TIMEOUT", "10"))
@@ -260,6 +332,23 @@ class User(SQLModel, table=True):
     token: str = Field(default="", index=True)
     is_default: bool = False
     created_at: datetime = Field(default_factory=_now)
+
+
+class AuditEvent(SQLModel, table=True):
+    """Phase 6: an append-only record of every mutating request. Written
+    by the observability middleware (never by endpoint code), so the
+    audit trail can't be skipped. Owner-scoped and read-only via
+    /api/audit; intentionally NOT in the privacy bundle/wipe set so the
+    trail is tamper-resistant and existing bundle counts are unchanged.
+    """
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    owner_id: str = Field(default=DEFAULT_UID, index=True)
+    request_id: str = Field(default="-", index=True)
+    method: str = ""
+    path: str = ""
+    status: int = 0
+    duration_ms: int = 0
+    at: datetime = Field(default_factory=_now)
 
 
 class Source(SQLModel, table=True):
@@ -1574,12 +1663,16 @@ def seed():
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    validate_config()          # Phase 6: fail fast on bad config
+    _logj("startup", auth=AUTH_ENABLED,
+          ai=os.getenv("APTIRO_AI_PROVIDER", "mock"))
     init_db()
     if SEED_ON_STARTUP:
         seed()
         seed_job_sources()
         seed_packages()
     yield
+    _logj("shutdown")
 
 
 app = FastAPI(title="Aptiro API", version="0.5.0", lifespan=lifespan)
@@ -1600,40 +1693,89 @@ def _mw_session():
 
 @app.middleware("http")
 async def _auth_context(request, call_next):
-    """Resolve the bearer token to a user id for the request. No token
-    -> the built-in local user (pre-Phase-4 behavior). When AUTH is
-    enabled, mutating methods require a valid token (read paths and the
-    auth/health endpoints stay open)."""
+    """Phase 4 identity + Phase 6 observability. Resolves the bearer
+    token to a user id (no token -> built-in local user; AUTH-on
+    requires a token for mutations), assigns a request id, logs one
+    structured line, stamps X-Request-ID on every response, and writes
+    an append-only AuditEvent for successful mutating requests."""
     from starlette.responses import JSONResponse
-    token = _bearer(request)
-    uid = DEFAULT_UID
-    if token:
-        s, gen = _mw_session()
-        try:
-            u = s.exec(select(User).where(User.token == token)).first()
-        finally:
-            try:
-                next(gen)
-            except StopIteration:
-                pass
-        if u:
-            uid = u.id
-        elif AUTH_ENABLED:
-            return JSONResponse(
-                {"detail": "Invalid or expired token"}, status_code=401)
-    path = request.url.path
-    is_open = (path.startswith("/api/auth/")
-               or path == "/api/health" or path == "/"
-               or not path.startswith("/api/"))
-    if (AUTH_ENABLED and not token and not is_open
-            and request.method in ("POST", "PUT", "PATCH", "DELETE")):
-        return JSONResponse(
-            {"detail": "Authentication required"}, status_code=401)
-    tok = _CURRENT_UID.set(uid)
+    rid = request.headers.get("x-request-id") or _uuidmod.uuid4().hex[:16]
+    rtok = _REQUEST_ID.set(rid)
+    started = _time.perf_counter()
+    method, path = request.method, request.url.path
+
+    def _stamp(resp):
+        resp.headers["X-Request-ID"] = rid
+        return resp
+
     try:
-        return await call_next(request)
+        token = _bearer(request)
+        uid = DEFAULT_UID
+        if token:
+            s, gen = _mw_session()
+            try:
+                u = s.exec(
+                    select(User).where(User.token == token)).first()
+            finally:
+                try:
+                    next(gen)
+                except StopIteration:
+                    pass
+            if u:
+                uid = u.id
+            elif AUTH_ENABLED:
+                _logj("request.denied", method=method, path=path,
+                      status=401, reason="invalid_token")
+                return _stamp(JSONResponse(
+                    {"detail": "Invalid or expired token"},
+                    status_code=401))
+        is_open = (path.startswith("/api/auth/")
+                   or path in ("/api/health", "/healthz", "/readyz", "/")
+                   or not path.startswith("/api/"))
+        if (AUTH_ENABLED and not token and not is_open
+                and method in ("POST", "PUT", "PATCH", "DELETE")):
+            _logj("request.denied", method=method, path=path,
+                  status=401, reason="auth_required")
+            return _stamp(JSONResponse(
+                {"detail": "Authentication required"}, status_code=401))
+
+        utok = _CURRENT_UID.set(uid)
+        try:
+            response = await call_next(request)
+        finally:
+            _CURRENT_UID.reset(utok)
+        dur = int((_time.perf_counter() - started) * 1000)
+        _logj("request", method=method, path=path,
+              status=response.status_code, duration_ms=dur, user=uid)
+        # Append-only audit for successful mutations (no bodies stored).
+        if (method in ("POST", "PUT", "PATCH", "DELETE")
+                and 200 <= response.status_code < 300
+                and path.startswith("/api/")):
+            try:
+                s, gen = _mw_session()
+                try:
+                    s.add(AuditEvent(
+                        owner_id=uid, request_id=rid, method=method,
+                        path=path, status=response.status_code,
+                        duration_ms=dur))
+                    s.commit()
+                finally:
+                    try:
+                        next(gen)
+                    except StopIteration:
+                        pass
+            except Exception as exc:   # never fail a request on audit
+                _logj("audit.error", message=repr(exc))
+        return _stamp(response)
+    except Exception as exc:
+        dur = int((_time.perf_counter() - started) * 1000)
+        _logj("request.error", method=method, path=path,
+              duration_ms=dur, error=type(exc).__name__, message=str(exc))
+        return _stamp(JSONResponse(
+            {"detail": "Internal server error", "request_id": rid},
+            status_code=500))
     finally:
-        _CURRENT_UID.reset(tok)
+        _REQUEST_ID.reset(rtok)
 app.include_router(sources_router)
 app.include_router(claims_router)
 app.include_router(strategy_router)
@@ -1667,7 +1809,29 @@ def health():
             "ai_assist": {
                 "provider": ai_provider.active_provider_name(),
                 "grounding_gate": True,
-                "auto_apply": False}}
+                "auto_apply": False},
+            "observability": {
+                "structured_logs": True, "request_id": True,
+                "audit_trail": True, "config_validation": True}}
+
+
+@app.get("/healthz")
+def healthz():
+    """Liveness: the process is up and serving. No dependencies."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readyz(session: Session = Depends(get_session)):
+    """Readiness: the database is reachable. 503 if not, so an
+    orchestrator can hold traffic until the app can actually serve."""
+    from sqlalchemy import text as _sql
+    try:
+        session.exec(_sql("SELECT 1"))
+        return {"status": "ready", "db": "ok"}
+    except Exception as exc:
+        _logj("readyz.fail", message=repr(exc))
+        raise HTTPException(503, "database not ready")
 
 
 # ===========================================================================
@@ -4091,3 +4255,37 @@ def whoami(session: Session = Depends(get_session)):
 
 
 app.include_router(auth_router)
+
+
+# ===========================================================================
+# Phase 6 - read-only audit trail (owner-scoped). The trail is written
+# only by the observability middleware and is intentionally not part of
+# the privacy export/wipe set, so it stays tamper-resistant.
+# ===========================================================================
+audit_router = APIRouter(prefix="/api/audit", tags=["audit"])
+
+
+class AuditEventOut(BaseModel):
+    id: str
+    request_id: str
+    method: str
+    path: str
+    status: int
+    duration_ms: int
+    at: datetime
+
+
+@audit_router.get("", response_model=List[AuditEventOut])
+def list_audit(limit: int = 200,
+               session: Session = Depends(get_session)):
+    limit = max(1, min(int(limit or 200), 1000))
+    rows = session.exec(
+        select(AuditEvent).where(AuditEvent.owner_id == _uid())
+        .order_by(AuditEvent.at.desc()).limit(limit)).all()
+    return [AuditEventOut(
+        id=a.id, request_id=a.request_id, method=a.method, path=a.path,
+        status=a.status, duration_ms=a.duration_ms, at=a.at)
+        for a in rows]
+
+
+app.include_router(audit_router)

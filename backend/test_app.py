@@ -1689,3 +1689,166 @@ def test_health_advertises_phase5_ai_assist(client):
     assert ai["provider"] == "mock"
     assert ai["grounding_gate"] is True
     assert ai["auto_apply"] is False
+
+
+# ===========================================================================
+# Phase 6 - production ops & observability
+# ===========================================================================
+import pathlib as _pl
+
+
+def test_healthz_liveness(client):
+    r = client.get("/healthz")
+    assert r.status_code == 200 and r.json()["status"] == "ok"
+
+
+def test_readyz_checks_db(client):
+    r = client.get("/readyz")
+    assert r.status_code == 200
+    assert r.json()["db"] == "ok"
+
+
+def test_request_id_header_on_success_and_error(client):
+    ok = client.get("/api/health")
+    assert ok.headers.get("X-Request-ID")
+    nf = client.get("/api/packages/does-not-exist")
+    assert nf.status_code == 404
+    assert nf.headers.get("X-Request-ID")
+    # client-supplied id is honored for correlation
+    given = client.get("/api/health",
+                        headers={"X-Request-ID": "corr-123"})
+    assert given.headers.get("X-Request-ID") == "corr-123"
+
+
+def test_error_body_shape_unchanged(client):
+    """The {'detail': ...} contract is frozen; correlation is additive
+    via the header only."""
+    r = client.get("/api/packages/nope")
+    assert r.status_code == 404
+    assert "detail" in r.json()
+
+
+def test_audit_event_written_for_mutations_only(client):
+    before = client.get("/api/audit").json()
+    client.post("/api/sources", json={
+        "source_type": "resume", "label": "a",
+        "raw_text": "Led product teams and shipped ML features widely."})
+    after = client.get("/api/audit").json()
+    assert len(after) == len(before) + 1
+    top = after[0]
+    assert top["method"] == "POST" and top["path"] == "/api/sources"
+    assert 200 <= top["status"] < 300
+    assert top["request_id"]
+    # a pure GET does not add an audit row
+    n = len(client.get("/api/audit").json())
+    client.get("/api/sources")
+    assert len(client.get("/api/audit").json()) == n
+
+
+def test_audit_is_owner_scoped(client):
+    a = _register(client, "auda@example.com")
+    b = _register(client, "audb@example.com")
+    client.post("/api/sources",
+                json={"source_type": "resume", "label": "x",
+                      "raw_text": "Shipped analytics dashboards to "
+                      "enterprise customers and led the team."},
+                headers=_auth(a["token"]))
+    aud_a = client.get("/api/audit", headers=_auth(a["token"])).json()
+    aud_b = client.get("/api/audit", headers=_auth(b["token"])).json()
+    assert any(e["path"] == "/api/sources" and e["method"] == "POST"
+               for e in aud_a)
+    assert all(e["method"] != "POST" or e["path"] != "/api/sources"
+               for e in aud_b) or aud_b == []
+
+
+def test_audit_not_in_privacy_bundle(client):
+    client.post("/api/sources", json={
+        "source_type": "resume", "label": "z",
+        "raw_text": "Managed roadmaps and delivered features broadly."})
+    bundle = client.get("/api/privacy/export").json()
+    # intentionally excluded so the trail is tamper-resistant and the
+    # earlier bundle-count contract is unchanged
+    assert "auditevent" not in bundle["data"]
+
+
+def test_validate_config_passes_by_default():
+    import app as A
+    assert A.validate_config() is True
+
+
+def test_validate_config_fails_fast_on_bad_env(monkeypatch):
+    import app as A
+    monkeypatch.setenv("APTIRO_URL_FETCH_TIMEOUT", "not-a-number")
+    with pytest.raises(A.ConfigError) as e:
+        A.validate_config()
+    assert "APTIRO_URL_FETCH_TIMEOUT" in str(e.value)
+    monkeypatch.setenv("APTIRO_URL_FETCH_TIMEOUT", "10")
+    monkeypatch.setenv("APTIRO_AUTH", "banana")
+    with pytest.raises(A.ConfigError) as e2:
+        A.validate_config()
+    assert "APTIRO_AUTH" in str(e2.value)
+
+
+def test_structured_log_is_json():
+    import io
+    import json as _j
+    import logging
+    import app as A
+    buf = io.StringIO()
+    h = logging.StreamHandler(buf)
+    h.setFormatter(logging.Formatter("%(message)s"))
+    A._log.addHandler(h)
+    try:
+        A._logj("unit.test", foo="bar", n=1)
+    finally:
+        A._log.removeHandler(h)
+    rec = _j.loads(buf.getvalue().strip().splitlines()[-1])
+    assert rec["event"] == "unit.test" and rec["foo"] == "bar"
+    assert "ts" in rec and "request_id" in rec
+
+
+def test_migration_chain_is_linear_and_single_head():
+    vdir = _pl.Path(__file__).parent / "alembic" / "versions"
+    revs, downs = {}, {}
+    import importlib.util
+    for f in sorted(vdir.glob("0*.py")):
+        spec = importlib.util.spec_from_file_location(f.stem, f)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        assert callable(m.upgrade) and callable(m.downgrade)
+        assert m.revision not in revs, "duplicate revision"
+        revs[m.revision] = m.down_revision
+        if m.down_revision:
+            downs[m.down_revision] = m.revision
+    # exactly one head (a revision nobody lists as their down_revision)
+    heads = [r for r in revs if r not in downs]
+    assert len(heads) == 1, ("expected single head, got %s" % heads)
+    # chain is fully connected back to the root
+    assert "0005_phase6_audit_event" in revs
+    assert revs["0005_phase6_audit_event"] == \
+        "0004_phase4_multiuser_auth"
+
+
+def test_ci_workflow_runs_the_suite():
+    root = _pl.Path(__file__).resolve().parents[1]
+    wf = root / ".github" / "workflows" / "ci.yml"
+    assert wf.exists(), "CI workflow missing"
+    txt = wf.read_text()
+    assert "pytest" in txt
+    assert "actions/checkout" in txt and "setup-python" in txt
+
+
+def test_dockerfile_runs_nonroot_with_healthcheck():
+    root = _pl.Path(__file__).resolve().parents[1]
+    df = (root / "Dockerfile.backend").read_text()
+    assert "USER aptiro" in df            # non-root
+    assert "HEALTHCHECK" in df and "/healthz" in df
+
+
+def test_health_advertises_observability(client):
+    h = client.get("/api/health").json()
+    o = h["observability"]
+    assert o["structured_logs"] is True
+    assert o["request_id"] is True
+    assert o["audit_trail"] is True
+    assert o["config_validation"] is True

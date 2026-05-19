@@ -1,3 +1,88 @@
+# CHANGES — Phase 6: Production ops & observability
+
+Phase 6 is **additive and behavior-preserving** — the final roadmap
+phase. Every Phase 1–5 + Delivery 1–4 invariant is untouched: the suite
+stays green and grew **122 → 136** (14 new tests, 0 removed, 0
+modified). Single-file `app.py` shape preserved; no new dependencies
+(stdlib `logging`/`json`/`time`/`uuid`). Aptiro now ships with the
+operational surface a real deployment needs, without changing any
+existing behavior.
+
+## Added
+
+- **Structured JSON logging + request IDs.** One JSON line per request
+  (`ts, event, request_id, method, path, status, duration_ms, user`).
+  Every request gets a 16-char id (a client-supplied `X-Request-ID` is
+  honoured); it is stamped on **every** response, success or error, for
+  end-to-end correlation. Level via `APTIRO_LOG_LEVEL`.
+- **Append-only audit trail** (`AuditEvent` + `GET /api/audit`). The
+  observability middleware - never endpoint code, so it can't be
+  skipped - records every successful mutating request (method, path,
+  status, duration, request id), owner-scoped. It is intentionally
+  **not** in the privacy export/wipe set, so the trail is
+  tamper-resistant and the earlier bundle-count contract is unchanged.
+- **Liveness & readiness probes.** `GET /healthz` (dependency-free
+  liveness) and `GET /readyz` (runs `SELECT 1`; **503** if the DB is
+  unreachable) so an orchestrator can hold traffic until the app can
+  actually serve.
+- **Fail-fast config validation.** `validate_config()` runs at startup
+  and rejects genuinely invalid configuration (non-numeric ceilings,
+  bad `APTIRO_AUTH`, empty DB URL) with a clear message; an
+  anthropic-without-key combo logs a loud warning. Defaults are always
+  valid, so normal startup and the suite are unaffected.
+- **CI workflow** (`.github/workflows/ci.yml`) - checks out, sets up
+  Python 3.12, installs deps, runs the full suite on every push/PR with
+  the deterministic offline env.
+- **Hardened container.** `Dockerfile.backend` now creates and runs as
+  an unprivileged user (`USER aptiro`, uid 10001) and adds a
+  `HEALTHCHECK` against `/healthz`.
+- **Frontend.** A new read-only **Activity** tab showing the audit
+  trail (method, path, status, latency, timestamp, request id).
+- **Alembic `0005_phase6_audit_event`** - creates the `auditevent`
+  table for pre-Phase-6 deployments; reversible.
+- **Postgres backup/restore notes** in the README.
+- **Tests (`test_app.py`, +14):** `/healthz` + `/readyz`;
+  `X-Request-ID` on success and error and honoured when supplied; the
+  `{'detail': ...}` error shape is unchanged; audit written for
+  mutations only, owner-scoped, and excluded from the privacy bundle;
+  `validate_config` passes by default and fails fast on bad env;
+  structured log is valid JSON; migration chain is linear with a single
+  head and 0005 chains correctly; CI workflow runs the suite; Dockerfile
+  is non-root with a healthcheck; health advertises observability.
+
+## Changed in `app.py` (surgical, additive only)
+
+- The existing Phase 4 auth middleware was extended (not duplicated) to
+  also do request-id, timing, structured logging, the `X-Request-ID`
+  stamp, and audit emission - one pass, ordering unchanged. The
+  `{'detail': ...}` error body is **frozen** (pinned by many tests);
+  correlation is purely additive via the header. Unhandled exceptions
+  now return `{'detail': 'Internal server error', 'request_id': ...}`
+  (500) instead of leaking a stack trace.
+- `lifespan` calls `validate_config()` first. `/api/health` gains an
+  `observability` block; `latest_phase` stays `4` and `phases_shipped`
+  `[1,2,3]` **on purpose** (pinned by earlier tests).
+
+## Explicitly NOT changed (non-negotiables honored)
+
+- No behavior change to any existing endpoint, the deterministic
+  council, the provenance/export gates, scoring, the tracker, per-user
+  isolation, or the AI grounding gate. No new dependencies. No
+  auto-submit / scraping / CAPTCHA bypass / fabrication. Audit + logs
+  never store request bodies or credentials.
+
+## Validation
+
+`pytest -q` → **136 passed**. End-to-end: `/healthz` 200,
+`/readyz` db ok; `X-Request-ID` present on 200 and 404 and honoured when
+supplied; a POST writes exactly one owner-scoped audit row while a GET
+writes none; `auditevent` is absent from the privacy bundle;
+`validate_config()` passes by default and raises on a bad numeric env;
+structured JSON log lines stream per request; health reports the
+`observability` block. The roadmap is now fully delivered.
+
+---
+
 # CHANGES — Phase 5: Grounded AI assist (provenance-safe)
 
 Phase 5 is **additive and behavior-preserving**. Every Phase 1–4 +

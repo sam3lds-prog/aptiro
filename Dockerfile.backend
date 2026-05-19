@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 # Build deps for psycopg2 + pdfplumber's image stack.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential libpq-dev \
+        build-essential libpq-dev curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -11,7 +11,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ .
 
+# Phase 6: run as an unprivileged user, not root.
+RUN useradd --create-home --uid 10001 aptiro \
+    && chown -R aptiro:aptiro /app
+USER aptiro
+
 EXPOSE 8000
+
+# Phase 6: container-level liveness against the dependency-free probe.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://localhost:8000/healthz || exit 1
 
 # On the production Postgres path, apply migrations (creates the schema
 # + pgvector extension) and then serve. Migration failures are fatal so

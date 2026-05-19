@@ -1,4 +1,4 @@
-# Aptiro — Trust + Discovery + Tracker + Multi-user + AI assist (Phase 5)
+# Aptiro — provenance-first job-application assistant (Phases 1–6 complete)
 
 Aptiro turns your own résumé/profile into **provenance-tracked claims**,
 discovers real jobs (paste a description or import a public posting URL
@@ -37,6 +37,13 @@ nothing is auto-applied. The deterministic mock provider is the default,
 so the app and full test suite run offline with no API key; the real
 Anthropic path is opt-in and equally gated.
 
+**Phase 6 (production ops & observability)** completes the roadmap:
+structured JSON logging with per-request IDs (`X-Request-ID` on every
+response), an append-only owner-scoped audit trail written by the
+server, `/healthz` and `/readyz` probes, fail-fast config validation, a
+GitHub Actions CI workflow, and a hardened non-root container with a
+healthcheck — all additive, with no change to existing behavior.
+
 ---
 
 ## Quick start (zero config — SQLite, mock AI)
@@ -72,7 +79,7 @@ docker compose up --build
 
 ```bash
 cd backend && . .venv/bin/activate
-pytest -q          # 122 tests, all green (P1 63 + P2 20 + P3 16 + P4 10 + P5 13; 0 removed)
+pytest -q          # 136 tests, all green (P1 63 +P2 20 +P3 16 +P4 10 +P5 13 +P6 14; 0 removed)
 ```
 
 Tests are deterministic and offline: in-memory SQLite, mock AI, no network.
@@ -155,3 +162,35 @@ artifacts (`[x]{.underline}`, `\$`, table rules) are stripped and the
 **summary/experience** content that actually feeds packages extracts
 cleanly; deep grid-table reconstruction is a parser-depth item for a
 later phase, not Trust + Export.
+
+---
+
+## Operations (Phase 6)
+
+Observability: every request emits one structured JSON log line and an
+`X-Request-ID` header (a client-supplied id is honoured). Successful
+mutations are recorded in an append-only, owner-scoped audit trail at
+`GET /api/audit` (and the **Activity** tab). Probes: `/healthz`
+(liveness, no dependencies) and `/readyz` (returns 503 until the
+database is reachable) — wire these into your orchestrator. Invalid
+configuration fails fast at startup with a clear message.
+
+### Postgres backup / restore
+
+```bash
+# Backup (compressed custom format)
+pg_dump --format=custom --no-owner \
+  "$APTIRO_DATABASE_URL" > aptiro_$(date +%Y%m%d).dump
+
+# Restore into a fresh database
+createdb aptiro
+pg_restore --clean --no-owner --dbname=aptiro aptiro_YYYYMMDD.dump
+
+# Schema is migration-managed; on a new target run migrations first:
+#   alembic upgrade head
+```
+
+Take backups before `alembic upgrade head` on a production database.
+The audit trail is intentionally excluded from the per-user privacy
+export/wipe so it remains tamper-resistant; back it up with the rest of
+the database.
