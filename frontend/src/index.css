@@ -1,0 +1,76 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Refined dark palette — deeper than the prototype, with measured contrast */
+  --bg: 13 16 22;            /* near-black blue */
+  --panel: 22 26 34;
+  --panel2: 30 35 45;
+  --line: 44 50 62;
+  --ink: 232 234 240;
+  --sub: 153 162 178;
+  --accent: 91 140 255;      /* indigo blue */
+  --accent2: 124 92 255;     /* violet */
+
+  /* Provenance — pinned across the whole app */
+  --prov-blue: 59 130 246;
+  --prov-purple: 139 92 246;
+  --prov-green: 34 197 94;
+  --prov-orange: 245 158 11;
+  --prov-red: 239 68 68;
+}
+
+html {
+  background: rgb(var(--bg));
+  color: rgb(var(--ink));
+  font-family: theme('fontFamily.sans');
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  margin: 0;
+  background: rgb(var(--bg));
+  min-height: 100vh;
+}
+
+/* Editorial display type for headlines & the wordmark */
+.font-display { font-family: theme('fontFamily.display'); letter-spacing: -0.01em; }
+
+/* Subtle grain to give surfaces atmosphere without going maximalist */
+.grain-bg::before {
+  content: "";
+  position: fixed; inset: 0;
+  pointer-events: none;
+  background-image: radial-gradient(rgba(255,255,255,0.018) 1px, transparent 1px);
+  background-size: 3px 3px;
+  z-index: 0;
+}
+
+/* Scrollbar polish — quiet, on-brand */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: rgb(var(--line)); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: rgb(var(--sub) / 0.55); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* Focus ring — visible, on-brand */
+*:focus-visible {
+  outline: 2px solid rgb(var(--accent));
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Tiny utility — section eyebrows */
+.eyebrow {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgb(var(--sub));
+  font-weight: 500;
+}
+
+/* Reduce motion */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}

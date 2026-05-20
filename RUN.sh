@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# Aptiro - zero-config local run (SQLite, mock AI, no Docker needed).
-# Starts the API and the single-file UI together. Ctrl-C stops both.
+# Aptiro — zero-config local run (SQLite, mock AI, no Docker needed).
+# Starts the FastAPI backend and the Vite dev server together.
+# Ctrl-C stops both.
 #
 #   ./RUN.sh
 #
-# Production (Postgres + pgvector) path instead:  docker compose up --build
+# Production (Postgres + pgvector + built frontend) path instead:
+#   docker compose up --build
+#
+# Phase 7 (frontend foundation): the UI is now a real Vite + React + TS
+# app. On first run this script will install node_modules; that takes
+# ~30s. Subsequent runs are instant.
 set -euo pipefail
 
 API_PORT="${APTIRO_API_PORT:-8000}"
@@ -19,23 +25,54 @@ for p in "$API_PORT" "$UI_PORT"; do
   fi
 done
 
+# --- Backend deps --------------------------------------------------------
 cd "$ROOT/backend"
 if [ ! -d .venv ]; then
-  echo "Creating virtualenv + installing requirements (first run only)..."
+  echo "[backend] creating virtualenv + installing requirements (first run only)..."
   python3 -m venv .venv
   ./.venv/bin/pip -q install -r requirements.txt
 fi
 
+# --- Frontend deps -------------------------------------------------------
+cd "$ROOT/frontend"
+if ! command -v npm >/dev/null 2>&1; then
+  echo "npm is required (install Node.js 20+ from https://nodejs.org)." >&2
+  exit 1
+fi
+if [ ! -d node_modules ]; then
+  echo "[frontend] installing npm dependencies (first run only)..."
+  if [ -f package-lock.json ]; then
+    npm ci --no-audit --no-fund
+  else
+    npm install --no-audit --no-fund
+  fi
+fi
+
+cd "$ROOT"
+echo
 echo "API  -> http://localhost:$API_PORT  (docs: /docs)"
 echo "UI   -> http://localhost:$UI_PORT"
 echo "DB   -> SQLite (zero-config). AI -> mock (deterministic)."
 echo
 
+# --- Start backend -------------------------------------------------------
+cd "$ROOT/backend"
 ./.venv/bin/uvicorn app:app --host 0.0.0.0 --port "$API_PORT" &
 API_PID=$!
-( cd "$ROOT/frontend" && exec python3 -m http.server "$UI_PORT" >/dev/null 2>&1 ) &
+
+# --- Start Vite dev server ----------------------------------------------
+cd "$ROOT/frontend"
+APTIRO_API="http://localhost:$API_PORT" \
+  npm run dev -- --host 0.0.0.0 --port "$UI_PORT" >/dev/null 2>&1 &
 UI_PID=$!
 
-cleanup() { echo; echo "Shutting down..."; kill "$API_PID" "$UI_PID" 2>/dev/null || true; }
+cleanup() {
+  echo
+  echo "Shutting down..."
+  kill "$API_PID" "$UI_PID" 2>/dev/null || true
+  wait "$API_PID" 2>/dev/null || true
+  wait "$UI_PID" 2>/dev/null || true
+}
 trap cleanup INT TERM EXIT
+
 wait "$API_PID"

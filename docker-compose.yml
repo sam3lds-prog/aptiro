@@ -1,10 +1,14 @@
-# Aptiro - production target (Decision 3): Postgres + pgvector.
+# Aptiro — production target (Postgres + pgvector + built frontend).
 # Local dev/test can still use zero-config SQLite (see README); this
 # compose file is the production-shaped path.
 #
 #   docker compose up --build
 #   UI  -> http://localhost:5173
 #   API -> http://localhost:8000  (docs at /docs)
+#
+# Phase 7 (frontend foundation): the frontend service is now a multi-
+# stage Node-build → nginx image. nginx reverse-proxies /api/* to the
+# backend service, so the UI talks to it through a single origin.
 
 services:
   db:
@@ -29,7 +33,7 @@ services:
       dockerfile: Dockerfile.backend
     environment:
       APTIRO_DATABASE_URL: postgresql+psycopg2://aptiro:aptiro@db:5432/aptiro
-      APTIRO_AI_PROVIDER: mock          # Decision 2: deterministic default
+      APTIRO_AI_PROVIDER: mock          # deterministic default
       APTIRO_SEED_ON_STARTUP: "1"
       # To enable Anthropic instead, set:
       # APTIRO_AI_PROVIDER: anthropic
@@ -41,17 +45,13 @@ services:
       - "8000:8000"
 
   frontend:
-    image: python:3.12-slim
-    working_dir: /srv
-    volumes:
-      - ./frontend:/srv:ro
-    # The UI is a single static file; it reads the API base from
-    # window.APTIRO_API (defaults to http://localhost:8000).
-    command: python -m http.server 5173
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
     depends_on:
       - backend
     ports:
-      - "5173:5173"
+      - "5173:80"
 
 volumes:
   aptiro_pgdata:

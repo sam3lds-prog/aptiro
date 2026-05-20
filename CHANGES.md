@@ -565,3 +565,205 @@ HTTP 200 (MD 1.1 KB, HTML 1.9 KB, valid DOCX zip 37 KB, `%PDF-` 2.6 KB)
 re-appears under the explicit `include_unsupported=true` override. The
 bullet-level unsupported-metric gate is additionally covered by
 dedicated tests in `test_app.py`.
+
+---
+
+# CHANGES — Phase 7: Frontend foundation (productize the UI)
+
+Phase 7 is **additive and behavior-preserving on the backend**. Every
+prior phase invariant is untouched: backend tests stay at **136 passed,
+0 removed, 0 modified**, all offline, all deterministic. This phase
+replaces the single-file CDN React app with a real production-grade
+frontend so the next phases (Truth Vault polish, Package Studio hero,
+Strategy Builder, real job providers, public research) can be built
+against a chassis that won't need to be thrown away.
+
+## Why this phase, why now
+
+The ChatGPT review correctly identified the frontend as the lowest-
+scored area (3/10) and the biggest gap between "working backend MVP"
+and "publishable product." Every screen called for in the roadmap —
+Truth Vault, Strategy Builder, Match Inbox, Job Detail, Package Studio,
+Application Tracker — needs a real component system, real routing, real
+state management, and real loading/empty/error states underneath it.
+This phase builds that chassis once.
+
+It is also additive on the **frontend** side: every existing screen is
+ported 1:1, no functionality removed. Phases 2–6 of the upgrade roadmap
+will improve specific screens; this phase only changes how they're
+built.
+
+## Added (new structure under `frontend/`)
+
+The old `frontend/index.html` (single-file React 18 via CDN + in-browser
+Babel) is replaced with a real Vite project.
+
+### Tech stack
+- **Vite 5** + **React 18** + **TypeScript 5** (strict mode).
+- **Tailwind 3** with custom design tokens.
+- **React Router v6** for client-side routing.
+- **TanStack Query v5** for server state (caching, invalidation).
+- **Zustand v5** for the small amount of local UI state (auth, toasts).
+- Zero new third-party UI libraries — every primitive is built in-house
+  against Tailwind to keep the bundle lean and the visual language
+  consistent.
+
+### Library layer
+- `src/lib/api.ts` — typed `api<T>()` client. Resolves the base from
+  `window.APTIRO_API`, attaches the bearer token from the auth store,
+  parses JSON, throws a typed `ApiError` (with status + body) on non-2xx
+  so pages can show specific messages. `downloadUrl()` builds direct
+  links for file exports.
+- `src/lib/types.ts` — TypeScript types modelled on the FastAPI Pydantic
+  schemas (Claim, Source, Strategy, Job, Match, Package, Application,
+  ApplySession, Health, Me, AuditEvent, …). Hand-maintained, not
+  codegen — small enough to keep accurate, big enough to catch real
+  bugs at compile time.
+- `src/lib/cn.ts` — tiny classNames helper.
+
+### Stores
+- `src/stores/auth.ts` — token + `Me` in Zustand, persisted to
+  `localStorage`. `getToken()` is a plain accessor so the API client
+  doesn't need React hooks.
+- `src/stores/toast.ts` — toast queue with auto-dismiss (4s info /
+  6.5s errors) + `useNotify()` helper returning `notify` / `success` /
+  `warn` / `error`.
+
+### UI primitives
+- `Button` — 4 variants (primary/secondary/ghost/danger) × 3 sizes,
+  loading-aware (spinner + disabled), focus-ring on brand.
+- `Card` — panel surface with optional title + actions row, compact
+  mode.
+- `Input`, `Textarea`, `Select`, `Label` — consistent form styling.
+- `Badge` — colorable status pills (provenance + neutral + ink tones).
+- `Modal` — accessible (escape to close, body scroll lock, focus
+  containment), 3 sizes.
+- `Skeleton`, `Spinner`, `EmptyState`, `LoadingBlock` — small shared
+  primitives.
+- `Toaster` — renders the queued toasts with kind-coloured borders.
+- `ErrorBoundary` — catches render errors with a recoverable panel
+  (Try Again + Reload), no full-page crash.
+- `ConfirmModal` — wraps Modal with confirm/cancel + a destructive
+  variant, async-friendly.
+- `ProvenanceBadge` — small dot + label, the visual core of Aptiro's
+  trust model.
+- `PageHeader` — consistent h1 + sublabel + actions row across every
+  page.
+
+### Layout + routing
+- `AppLayout` — sidebar + main content area, subtle grain backdrop.
+- `Nav` — wordmark, route-aware navigation, logout pinned at bottom
+  when authed.
+- `App.tsx` — boot logic: hits `/health` to detect auth, hits
+  `/auth/me` when auth is on, renders the `Auth` page or the routed
+  `AppLayout` accordingly. API-unreachable falls through so pages can
+  show their own error states.
+
+### Pages (ported 1:1 from the single-file app)
+- **Dashboard** — onboarding checklist with completion count, provenance
+  legend, health snapshot, flow shortcuts.
+- **Vault** — three-pane layout (sources list / claims feed / inspector
+  inline). Upload (PDF/DOCX/TXT/MD) + paste, per-claim approve / edit /
+  reject / do-not-use with full source snippet + section + confidence,
+  source delete with confirmation modal.
+- **Strategy** — singular strategy editor (kept matching the existing
+  `/api/strategy` contract; the upgrade to multi-strategy is Phase 4 of
+  the upgrade roadmap).
+- **Jobs** — paste JD, import-from-URL, fetch the mock provider, list
+  imported jobs with archive and source link.
+- **Matches** — explainable score breakdown per job, weighted
+  components with progress bars, evidence citations, matched skills,
+  gap list, secondary semantic signal clearly marked as non-scoring.
+- **Packages** — build from a job, per-bullet accept / rewrite / reject
+  / lock / AI suggest controls with provenance colour stripe, agent
+  council orchestrate, AI cover letter (gated), export panel with
+  format + artifact + include-unsupported override, gate preview
+  side-by-side (included vs excluded with reasons).
+- **Tracker** — application lifecycle with state-machine transitions,
+  deterministic follow-up reminders, immutable snapshot viewer, CSV
+  export link.
+- **Apply** — apply-session state machine with explicit guardrails,
+  field plan, allowed actions, history.
+- **Activity** — append-only audit trail rendered from `/api/audit`.
+- **Privacy** — JSON export + delete-all-data confirmation modal.
+- **Auth** — login / register tabs, only shown when `health.auth.enabled`
+  is true.
+- **NotFound** — friendly 404 with home link.
+
+### Deploy plumbing
+- `frontend/nginx.conf` — gzip on, hashed asset caching, no-cache on
+  `index.html`, **`/api/` reverse-proxied to the backend container**,
+  SPA fallback to `index.html` so React Router routes resolve.
+- `Dockerfile.frontend` — multi-stage: Node 20 builder runs `npm ci` +
+  `npm run build`, nginx 1.27 runtime serves `/usr/share/nginx/html`
+  with a healthcheck.
+- `docker-compose.yml` — frontend service swapped from
+  `python -m http.server` to the new image (port 5173 → container 80).
+- `RUN.sh` — first run installs venv + node_modules, then starts
+  uvicorn + `npm run dev` together with clean Ctrl-C teardown. UI now
+  has hot reload.
+- `validate.sh` — **new Phase 0 gate.** Checks folder structure, runs
+  pytest (asserts ≥136 passed), verifies the Vite entry is wired,
+  optionally runs `npm run typecheck` + `npm run build`, optionally
+  runs `docker compose build`. Each step prints PASS/FAIL; exits
+  non-zero on any failure.
+
+## Changed (small)
+- `README.md` — Phase 7 framing, updated quick-start (Node.js 20+
+  required), production-path note that nginx now proxies `/api`,
+  validation gate documented.
+
+## Explicitly NOT changed
+- `backend/app.py`, `backend/test_app.py`, `backend/ingestion.py`,
+  `backend/exporting.py`, `backend/ai_provider.py`,
+  `backend/embeddings.py` — byte-for-byte unchanged.
+- `Dockerfile.backend`, `.env.example`, `alembic/` migrations — byte-
+  for-byte unchanged.
+- All 136 backend tests stay green offline with no key.
+- The export trust gate, the AI grounding gate, the no-auto-submit
+  posture, and the per-user isolation contract are all untouched.
+
+## Design choices worth flagging
+
+- **Typography**: Fraunces (display, optical-size aware) + IBM Plex
+  Sans (UI body) + IBM Plex Mono (numbers and IDs). Distinctive without
+  being noisy; both Google-hosted, loaded with `display=swap`.
+- **Palette**: refined dark by default (deeper background than the
+  prototype, measured contrast on cards). Provenance colours pinned
+  exactly (blue/purple/green/orange/red). All colours flow through CSS
+  variables in `index.css` so Phase 3 (Package Studio hero) can layer a
+  light "paper" treatment on top without touching primitives.
+- **No new design-system dep**: the in-house primitives keep the visual
+  language under our control and the bundle small. shadcn/ui is fine
+  but adds a CLI generation step and committed copies of every
+  component — not worth it at this size.
+- **Routing is real but minimal**: one route per product area today.
+  Sub-routes (e.g. `/packages/:id` for the future Package Studio detail
+  view) are already wired so Phase 3 can add the detail page without
+  re-architecting.
+
+## Validation
+
+- Backend tests: `cd backend && pytest -q` → **136 passed** (offline,
+  no key, no network).
+- Frontend typecheck: `cd frontend && npm run typecheck` → clean
+  (TypeScript strict mode, no `any` slack).
+- Frontend build: `cd frontend && npm run build` → succeeds; static
+  artifacts in `frontend/dist/`.
+- End-to-end: `./RUN.sh` boots both, every existing capability works
+  through the new app (upload, paste, approve, build package, orchestrate
+  council, AI suggest with gate, export with preview, track application,
+  audit, privacy export/delete).
+- Docker: `docker compose up --build` brings up Postgres + pgvector +
+  backend + nginx-served frontend; UI talks to the API through nginx's
+  `/api` proxy on a single origin.
+
+## What this unblocks (the rest of the upgrade roadmap)
+
+Phase 1 of the upgrade roadmap is now complete. Phases 2–9 (Truth Vault
+polish, Package Studio hero, multi-strategy, real job providers, public
+research, real notifications, auth hardening, backend modularization)
+can all be built against this chassis without throwing away work.
+
+See `APTIRO_UPGRADE_ROADMAP.md` for the full sequence and the
+per-phase build prompts.
