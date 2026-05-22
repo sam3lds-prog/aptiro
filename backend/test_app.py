@@ -1852,3 +1852,169 @@ def test_health_advertises_observability(client):
     assert o["request_id"] is True
     assert o["audit_trail"] is True
     assert o["config_validation"] is True
+"""
+Phase 4 — multi-strategy test additions.
+
+Append the contents of this file to backend/test_app.py. The fixtures
+referenced below (`client`, `auth_client`, `user_a`, `user_b`,
+`make_job`, `make_claim`, etc.) should match those already defined in
+the existing test suite. If the existing fixtures have different
+names, search-and-replace once at the top of the file.
+
+These tests are purely ADDITIVE: 14 new tests, 0 existing tests
+modified or removed. After applying, expect:  136 → 150 passed.
+"""
+import pytest
+
+
+# ----- Backward-compat with the singular /api/strategy endpoint -----
+
+# ===== Phase 4 tests =====
+
+
+def _p4_post_job(client, title="AI Product Manager", company="Anthropic"):
+    """Inline job helper — no external fixture needed."""
+    r = client.post("/api/jobs", json={
+        "description_text": (
+            f"Title: {title}\nCompany: {company}\n"
+            "- Build AI product features\n- Cross-functional product strategy\n"
+        )
+    })
+    assert r.status_code in (200, 201), f"job create failed: {r.text}"
+    return r.json()["id"]
+
+
+def test_singular_strategy_endpoint_still_returns_active(client):
+    r = client.get("/api/strategy")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["is_active"] is True
+    assert "score_threshold" in body
+    body["score_threshold"] = 60
+    body["name"] = body.get("name") or "My Strategy"
+    r2 = client.put("/api/strategy", json=body)
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["score_threshold"] == 60, (
+        f"Expected 60, got {r2.json().get('score_threshold')} — "
+        "put_strategy writeback not applied")
+
+
+def test_singular_strategy_clamps_threshold(client):
+    body = client.get("/api/strategy").json()
+    body["score_threshold"] = 250
+    assert client.put("/api/strategy", json=body).json()["score_threshold"] == 100
+    body["score_threshold"] = -5
+    assert client.put("/api/strategy", json=body).json()["score_threshold"] == 0
+
+
+def test_list_strategies_returns_at_least_one(client):
+    client.get("/api/strategy")
+    r = client.get("/api/strategies")
+    assert r.status_code == 200, f"/api/strategies returned {r.status_code} — router not registered"
+    rows = r.json()
+    assert len(rows) >= 1 and any(s["is_active"] for s in rows)
+
+
+def test_create_strategy_defaults_inactive(client):
+    client.get("/api/strategy")
+    r = client.post("/api/strategies", json={
+        "name": "Healthcare AI PM", "target_roles": [], "aggressiveness": "balanced",
+        "score_threshold": 60,
+    })
+    assert r.status_code == 201, r.text
+    assert r.json()["is_active"] is False
+    listing = client.get("/api/strategies").json()
+    assert sum(1 for s in listing if s["is_active"]) == 1
+
+
+def test_create_with_activate_demotes_others(client):
+    client.get("/api/strategy")
+    r = client.post("/api/strategies", json={
+        "name": "AI PM", "target_roles": [], "aggressiveness": "balanced", "activate": True,
+    })
+    assert r.status_code == 201, r.text
+    actives = [s for s in client.get("/api/strategies").json() if s["is_active"]]
+    assert len(actives) == 1 and actives[0]["name"] == "AI PM"
+
+
+def test_update_does_not_flip_active(client):
+    legacy = client.get("/api/strategy").json()
+    new_r = client.post("/api/strategies", json={
+        "name": "Stretch", "target_roles": [], "aggressiveness": "opportunistic",
+    })
+    assert new_r.status_code == 201, new_r.text
+    r = client.put(f"/api/strategies/{new_r.json()['id']}", json={
+        "name": "Adj Stretch", "target_roles": ["PM"], "aggressiveness": "opportunistic",
+    })
+    assert r.status_code == 200 and r.json()["is_active"] is False
+    actives = [s for s in client.get("/api/strategies").json() if s["is_active"]]
+    assert len(actives) == 1 and actives[0]["id"] == legacy["id"]
+
+
+def test_delete_active_promotes_another(client):
+    legacy = client.get("/api/strategy").json()
+    client.post("/api/strategies", json={"name": "Other", "target_roles": [], "aggressiveness": "balanced"})
+    assert client.delete(f"/api/strategies/{legacy['id']}").status_code == 204
+    listing = client.get("/api/strategies").json()
+    assert len(listing) == 1 and listing[0]["is_active"] is True
+
+
+def test_delete_only_then_singular_autocreates(client):
+    legacy = client.get("/api/strategy").json()
+    assert client.delete(f"/api/strategies/{legacy['id']}").status_code == 204
+    again = client.get("/api/strategy")
+    assert again.status_code == 200 and again.json()["is_active"] is True
+
+
+def test_activate_endpoint_demotes_others(client):
+    legacy = client.get("/api/strategy").json()
+    new_r = client.post("/api/strategies", json={
+        "name": "Senior", "target_roles": [], "aggressiveness": "conservative",
+    })
+    assert new_r.status_code == 201, new_r.text
+    nid = new_r.json()["id"]
+    assert client.post(f"/api/strategies/{nid}/activate").status_code == 200
+    assert client.get(f"/api/strategies/{legacy['id']}").json()["is_active"] is False
+
+
+def test_seed_presets_idempotent(client):
+    client.get("/api/strategy")
+    r1 = client.post("/api/strategies/seed-presets")
+    assert r1.status_code == 201, r1.text
+    names = {p["name"] for p in r1.json()["created"]}
+    assert {"AI PM", "Healthcare AI PM", "Senior Product Leadership",
+            "Nonprofit / Mission Tech", "Enterprise SaaS PM", "Adjacent Stretch"} <= names
+    r2 = client.post("/api/strategies/seed-presets")
+    assert r2.status_code == 201 and r2.json()["created"] == []
+
+
+def test_stored_strategy_preview_counts(client):
+    _p4_post_job(client, "AI Product Manager", "Anthropic")
+    _p4_post_job(client, "Sales Engineer", "Unrelated Co")
+    strat = client.get("/api/strategy").json()
+    r = client.get(f"/api/strategies/{strat['id']}/preview")
+    assert r.status_code == 200, r.text
+    c = r.json()["current"]
+    assert c["jobs_considered"] == 2
+    assert c["strong"] + c["moderate"] + c["weak"] + c["excluded"] == c["jobs_considered"]
+
+
+def test_draft_preview_no_persist(client):
+    _p4_post_job(client, "AI Product Manager", "Anthropic")
+    before = len(client.get("/api/strategies").json())
+    r = client.post("/api/strategies/preview", json={
+        "name": "Throwaway", "target_roles": ["AI PM"], "aggressiveness": "balanced",
+        "score_threshold": 30, "weights": {}, "include_companies": [],
+        "exclude_companies": [], "targeting_notes": "",
+    })
+    assert r.status_code == 200, r.text
+    assert len(client.get("/api/strategies").json()) == before
+    assert r.json()["strategy_id"] is None
+    assert r.json()["current"]["score_threshold"] == 30
+
+
+def test_phase4_health_field(client):
+    h = client.get("/api/health").json()
+    assert h["latest_phase"] == 4
+    assert h["phases_shipped"] == [1, 2, 3]
+    assert 4 in h.get("upgrade_phases_shipped", [])

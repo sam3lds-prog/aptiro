@@ -12,7 +12,7 @@ export type BulletStatus = "drafted" | "accepted" | "rejected" | "rewritten" | "
 
 export type WorkMode = "any" | "remote" | "hybrid" | "onsite";
 
-export type Aggressiveness = "conservative" | "balanced" | "aggressive";
+export type Aggressiveness = "conservative" | "balanced" | "opportunistic";
 
 export type SourceType = "resume" | "linkedin" | "portfolio" | "public_article" | "manual_note";
 
@@ -65,6 +65,7 @@ export interface Strategy {
   include_companies: string[];
   exclude_companies: string[];
   targeting_notes: string;
+  score_threshold: number;
   is_active: boolean;
   updated_at: string;
 }
@@ -242,4 +243,43 @@ export interface AuthSuccess {
   email: string;
   name: string;
   token: string;
+}
+
+
+// ===== Phase 4 — multi-strategy types (appended by deploy) =====
+
+export interface StrategyListItem {
+  id: string; name: string; is_active: boolean;
+  aggressiveness: Aggressiveness; score_threshold: number;
+  target_roles: string[]; work_mode: WorkMode; updated_at: string;
+}
+
+export interface StrategyPreviewCounts {
+  jobs_considered: number; above_threshold: number;
+  strong: number; moderate: number; weak: number; excluded: number;
+  avg_score: number; top_score: number; score_threshold: number;
+  threshold_passing_titles: string[];
+}
+
+export interface StrategyPreview {
+  strategy_id: string | null; strategy_name: string;
+  current: StrategyPreviewCounts;
+  active: StrategyPreviewCounts | null;
+  summary: string;
+}
+
+export interface StrategyUpsertBody {
+  name: string; target_roles: string[]; region?: string | null;
+  work_mode: WorkMode; salary_min?: number | null;
+  salary_max?: number | null; aggressiveness: Aggressiveness;
+  weights: Record<string, number>;
+  include_companies: string[]; exclude_companies: string[];
+  targeting_notes: string; score_threshold: number;
+  activate?: boolean;
+}
+
+export interface SeedPresetsResult {
+  created: StrategyListItem[];
+  skipped_existing: string[];
+  note: string;
 }
