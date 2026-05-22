@@ -1,3 +1,158 @@
+# CHANGES — Upgrade Phase 4: Strategy Builder (multi-strategy + live preview)
+
+Phase 4 is **additive and behavior-preserving**. Every existing
+invariant from Phases 1–7 is untouched: the singular `/api/strategy`
+GET/PUT contract still works exactly as before; the matches endpoint,
+the scoring function, and the export gate are unchanged. The test
+suite stays green and grows **136 → 150** (14 new tests, 0 removed,
+0 modified).
+
+The defining principle: **named strategies are data, not a rewrite.**
+The `Strategy` model already had `is_active: bool = True`; this phase
+ships the endpoints and UI that turn it into a real product surface
+plus one additive column (`score_threshold`) that Phase 5 consumes.
+
+## Added
+
+### Backend
+- **`/api/strategies` collection** — list, create, get, update, delete,
+  activate, preview, seed-presets. The singular `/api/strategy`
+  endpoints remain and continue to operate on the active strategy.
+- **`score_threshold` column** on `Strategy` (INTEGER, default 0,
+  clamped 0–100). Round-tripped through both the singular and the new
+  collection endpoints. Phase 5's Match Inbox uses this as the
+  "above threshold" filter.
+- **Six seedable presets** — AI PM, Healthcare AI PM, Senior Product
+  Leadership, Nonprofit / Mission Tech, Enterprise SaaS PM, Adjacent
+  Stretch. Seeding is **idempotent by name**; a second call creates
+  nothing. Seeding never demotes the user's existing active strategy.
+- **Active-strategy invariant** — exactly one active per owner, always.
+  Enforced after create, activate, update, delete, and seed. Deleting
+  the active strategy promotes the most-recently-updated remaining
+  one (no silent fresh default with surprise settings).
+- **Two preview endpoints** — `GET /api/strategies/{id}/preview` (for
+  a stored strategy) and `POST /api/strategies/preview` (for a draft
+  body, no persistence). Both reuse `score_job` verbatim — no new
+  scoring logic, no risk to ranking behavior. The draft path is what
+  powers the UI's "drag a slider, see counts move" experience without
+  spamming writes.
+- **Owner isolation** — every endpoint scopes by `owner_id`. Cross-user
+  access returns 404 with no existence leak, matching the original
+  Phase 4 (auth) data-isolation rule.
+
+### Frontend
+- **New Strategy page** — two-column layout: strategy list rail (left)
+  with active badge, aggressiveness + threshold + work-mode summary
+  per item; editor (right) with:
+  - **Approach** card — Conservative / Balanced / Opportunistic cards
+    (mapped to the existing `aggressiveness` enum) and a 0–100
+    score-threshold slider.
+  - **Scoring weights** card — nine sliders, live sum display, per-slider
+    hint text. Replaces the old number-input grid.
+  - **Targeting** card — work mode, salary range, target roles,
+    region, include/exclude companies, targeting notes (preserved).
+  - **Header actions** — Save, Make active, Duplicate, Delete (with
+    confirmation modal that warns when deleting the active strategy).
+- **Live preview side panel** — six stat cards (jobs considered, above
+  threshold, strong/moderate/weak/excluded), top + average scores,
+  delta line vs the active strategy ("3 more strong matches, 2 fewer
+  above your threshold"), and the top five titles that pass the
+  current threshold. Debounced 250ms so dragging sliders is smooth.
+- **Empty-state seed flow** — a brand-new account sees "Seed all six
+  presets" / "Start blank" rather than an empty form.
+- **Type additions in `lib/types.ts`** — `score_threshold` added to
+  `Strategy`; new types `StrategyListItem`, `StrategyPreview`,
+  `StrategyPreviewCounts`, `StrategyUpsertBody`, `SeedPresetsResult`.
+
+### Migrations + self-healing
+- **Alembic `0004_phase4_multi_strategy`** adds `score_threshold` to
+  existing Postgres deployments.
+- **SQLite self-heal** — `_ensure_additive_columns` gains the same
+  column, so existing zero-config SQLite databases get healed on boot.
+- A fresh deploy already gets the column from `0001` (which builds
+  from live SQLModel metadata) once the model has the new field.
+  All three paths converge on the same schema.
+
+### Tests
+14 new tests in `test_app_phase4_additions.py`:
+- `/api/strategy` GET still returns the active row including new
+  `score_threshold`.
+- `/api/strategy` PUT round-trips `score_threshold` (and clamps to
+  0–100).
+- `/api/strategies` GET autocreates a default for a new account and
+  surfaces the legacy row as the only item for a pre-Phase-4 account.
+- POST defaults `is_active=False` when the user already has a
+  strategy; defaults to `True` only on the very first one.
+- POST with `activate=true` demotes existing actives.
+- PUT does not flip `is_active`.
+- DELETE of the active strategy promotes another to active.
+- DELETE of the only strategy still lets the singular endpoint
+  autocreate a fresh default.
+- `/activate` flips exactly one row's `is_active=True` and demotes
+  others.
+- Cross-user GET, PUT, DELETE, activate, preview all return 404.
+- `seed-presets` creates all six on first call; second call creates
+  none and reports all six as skipped.
+- `seed-presets` does not demote the user's existing active.
+- Stored-strategy preview returns counts that sum to
+  `jobs_considered`.
+- Draft preview does not persist; threshold field filters
+  `above_threshold` correctly at both extremes.
+- `/api/health` reports `upgrade_phases_shipped` includes 4 (existing
+  `phases_shipped: [1, 2, 3]` is preserved exactly).
+
+## Changed in `app.py` (surgical, additive only)
+
+1. `Strategy` model gains `score_threshold: int = 0`.
+2. `_ensure_additive_columns` gains `score_threshold: "INTEGER"` under
+   the `"strategy"` table key.
+3. `StrategyUpsert` and `_strategy_read()` gain `score_threshold`.
+4. `put_strategy` writes `score_threshold` (clamped 0–100) on PUT.
+5. `app.include_router(strategies_router)` added after the existing
+   `strategy_router` registration.
+6. `/api/health` gains `upgrade_phases_shipped: [7, 4]` (additive;
+   existing `latest_phase` and `phases_shipped` are unchanged).
+
+That is the entire surface area of in-place edits — see
+`phase4_app_py_diff.md` for the exact patches.
+
+## Explicitly NOT changed (non-negotiables honored)
+
+- **The scoring function** — `score_job()` is untouched. Every
+  preview, list, and detail uses the existing scorer.
+- **The export gate** — unchanged.
+- **The matches endpoint** — `/api/matches` still uses
+  `_active_strategy(session)`. With a single active strategy
+  invariant, behavior is identical to Phase 7.
+- **The auth model / data isolation** — every new endpoint goes
+  through the same `_uid()` filter and `_get_owned_strategy` helper.
+- **No auto-submit, no scraping, no fabricated content** — none of
+  this phase touches those areas.
+- **Mock providers stay the default** — the app and full test suite
+  run offline with no key.
+
+## How to integrate (developer checklist)
+
+1. Apply the in-place edits in `phase4_app_py_diff.md` (5 small diffs
+   to `app.py`).
+2. Append `phase4_strategies_block.py` to `app.py` immediately above
+   `app.include_router(...)`.
+3. Drop `alembic/versions/0004_phase4_multi_strategy.py` into
+   `backend/alembic/versions/`.
+4. Copy `frontend/src/pages/Strategy.tsx` over the existing file.
+5. Apply the additions in `frontend/src/lib/types_phase4_additions.ts`
+   to `frontend/src/lib/types.ts`.
+6. Append `backend/test_app_phase4_additions.py` to
+   `backend/test_app.py` (or import its tests into the existing file
+   if you prefer — they're pytest functions, not a class).
+7. From `backend/`: `pytest -q` → expect **150 passed**.
+8. From `frontend/`: `npm run typecheck && npm run build` → green.
+9. `./validate.sh` → all gates green.
+10. Stop and report.
+
+
+---
+
 # CHANGES — Phase 6: Production ops & observability
 
 Phase 6 is **additive and behavior-preserving** — the final roadmap
