@@ -451,6 +451,11 @@ class JobPosting(SQLModel, table=True):
     posted_at: Optional[str] = None
     imported_at: datetime = Field(default_factory=_now)
     is_archived: bool = False
+    # Phase 5: provider tracking + freshness
+    provider_source: Optional[str] = None
+    provider_job_id: Optional[str] = None
+    last_seen_at: Optional[datetime] = Field(default=None)
+    is_stale: bool = False
 
 
 class ApplicationPackage(SQLModel, table=True):
@@ -599,6 +604,10 @@ def _ensure_additive_columns():
             "structured_requirements": "JSON" if not _IS_SQLITE
             else "TEXT",
             "owner_id": _owner_ddl,
+            "provider_source": "TEXT",
+            "provider_job_id": "TEXT",
+            "last_seen_at": "DATETIME",
+            "is_stale": "INTEGER",
         },
         "source": {"owner_id": _owner_ddl},
         "profileclaim": {"owner_id": _owner_ddl},
@@ -1309,6 +1318,11 @@ class JobRead(BaseModel):
     deduplicated: bool = False
     posted_at: Optional[str]
     imported_at: datetime
+    # Phase 5
+    provider_source: Optional[str] = None
+    provider_job_id: Optional[str] = None
+    last_seen_at: Optional[datetime] = None
+    is_stale: bool = False
 
 
 sources_router = APIRouter(prefix="/api/sources", tags=["sources"])
@@ -1527,7 +1541,11 @@ def _job_read(j, deduplicated=False):
         description_text=j.description_text, requirements=j.requirements,
         structured_requirements=j.structured_requirements or {},
         is_archived=j.is_archived, deduplicated=deduplicated,
-        posted_at=j.posted_at, imported_at=j.imported_at)
+        posted_at=j.posted_at, imported_at=j.imported_at,
+        provider_source=getattr(j, 'provider_source', None),
+        provider_job_id=getattr(j, 'provider_job_id', None),
+        last_seen_at=getattr(j, 'last_seen_at', None),
+        is_stale=bool(getattr(j, 'is_stale', False)))
 
 
 @jobs_router.get("", response_model=List[JobRead])
@@ -1795,7 +1813,7 @@ def health():
     return {"status": "ok", "app": "Aptiro", "delivery": 4,
             "slice": "trust-export", "phase": 2,
             "phases_shipped": [1, 2, 3], "latest_phase": 4,
-            "upgrade_phases_shipped": [7, 4],
+            "upgrade_phases_shipped": [7, 4, 5],
             "providers": {"ai": AI_PROVIDER, "job": JOB_PROVIDER,
                           "search": SEARCH_PROVIDER,
                           "notification": NOTIFICATION_PROVIDER,
@@ -1927,6 +1945,15 @@ _SOURCE_SAMPLE_JOBS = {
 
 
 def fetch_jobs_from_source(provider, query, limit):
+    # Phase 5: route to real provider when explicitly configured
+    # and httpx is available; always falls back to mock samples.
+    if (provider == 'remotive'
+            and os.getenv('APTIRO_JOB_PROVIDER', 'mock').lower()
+               == 'remotive'
+            and _httpx is not None):
+        real = _fetch_remotive_real(query, limit or 20)
+        if real:
+            return provider, real
     samples = _SOURCE_SAMPLE_JOBS.get(provider, [])
     if query:
         ql = query.lower()
@@ -1944,7 +1971,9 @@ def fetch_jobs_from_source(provider, query, limit):
             source=provider, source_url="https://example.com/%s" % provider,
             description_text=s["description_text"],
             requirements=s.get("requirements", []),
-            posted_at="2026-05-01"))
+            posted_at="2026-05-01",
+            provider_source=provider,
+            last_seen_at=_now(), is_stale=False))
     return provider, jobs
 
 
@@ -5224,3 +5253,310 @@ def seed_presets(session: Session = Depends(get_session)):
 
 
 app.include_router(strategies_router)
+
+
+# ===========================================================================
+# Phase 5 (Upgrade) — Match Inbox + Real Providers + Saved Searches
+#
+# APPEND this file to backend/app.py:
+#   cat fix2_app_phase5_additions.py >> backend/app.py
+#
+# KEY FIX vs the original: refresh-staleness and saved-searches use a
+# NEW router (jobs_phase5_router / saved_searches_router) that is
+# registered HERE with app.include_router(). This avoids the 405 that
+# occurs when you try to add a route to jobs_router after it has already
+# been passed to app.include_router() earlier in the file.
+# ===========================================================================
+
+# ── Phase 5: SavedSearch model ───────────────────────────────────────────
+class SavedSearch(SQLModel, table=True):
+    """User-created recurring job search with optional scheduling.
+    frequency: 'manual' | 'daily' | 'weekly'
+    provider: None = use APTIRO_JOB_PROVIDER env default.
+    """
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    owner_id: str = Field(default=DEFAULT_UID, index=True)
+    name: str = ""
+    query: str = ""
+    provider: Optional[str] = None
+    min_salary: Optional[int] = None
+    max_salary: Optional[int] = None
+    work_mode: Optional[str] = None
+    location_filter: Optional[str] = None
+    frequency: str = "manual"
+    last_run_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_now)
+    is_active: bool = True
+
+
+# ── Phase 5: real Remotive provider (opt-in, graceful fallback) ──────────
+def _fetch_remotive_real(query: Optional[str], limit: int) -> List[JobPosting]:
+    """Fetch from public Remotive JSON API (no auth required).
+    Returns [] on any error — caller always receives a list."""
+    if _httpx is None:
+        return []
+    timeout = float(os.getenv("APTIRO_JOB_FETCH_TIMEOUT", "15"))
+    try:
+        params: dict = {"limit": min(limit, 50)}
+        if query:
+            params["search"] = query
+        with _httpx.Client(timeout=timeout) as client:
+            resp = client.get("https://remotive.com/api/remote-jobs",
+                              params=params)
+            resp.raise_for_status()
+            data = resp.json()
+        results: List[JobPosting] = []
+        for item in data.get("jobs", [])[:limit]:
+            desc = item.get("description", "")
+            sal_m = _SALARY.search(item.get("salary", ""))
+            sal_min = sal_max = None
+            if sal_m:
+                has_k = bool(re.search(r"\d\s?[kK]", sal_m.group(0)))
+                sal_min = _money(sal_m.group(1), has_k)
+                sal_max = _money(sal_m.group(2), has_k)
+            results.append(JobPosting(
+                title=(item.get("title") or "")[:160],
+                company=(item.get("company_name") or "")[:120],
+                location=item.get("candidate_required_location", "Remote"),
+                work_mode=WorkMode.remote,
+                salary_min=sal_min, salary_max=sal_max,
+                source="remotive", source_url=item.get("url"),
+                description_text=desc,
+                requirements=_extract_requirements(desc),
+                structured_requirements=_structured_requirements(desc),
+                posted_at=item.get("publication_date"),
+                provider_source="remotive",
+                provider_job_id=str(item.get("id", "")),
+                last_seen_at=_now(), is_stale=False,
+            ))
+        return results
+    except Exception as exc:
+        _logj("remotive.fetch.error", error=repr(exc))
+        return []
+
+
+# ── Phase 5: new mini-router so routes register correctly ────────────────
+# jobs_router was already include_router'd earlier in app.py.
+# Adding routes to it after that call has no effect.
+# This dedicated router is registered below with a fresh include_router().
+_jobs_p5_router = APIRouter(tags=["jobs-phase5"])
+_ss_router = APIRouter(prefix="/api/saved-searches", tags=["saved-searches"])
+
+
+@_jobs_p5_router.post("/api/jobs/refresh-staleness")
+def refresh_staleness(session: Session = Depends(get_session)):
+    """Mark jobs not seen for 30+ days as stale (additive flag only).
+    SQLite: the new columns are added by _ensure_additive_columns on boot
+    so getattr(..., None) is used as a safe fallback during the first run
+    before the app has restarted after the column addition."""
+    from datetime import timedelta
+    cutoff = _now() - timedelta(days=30)
+    rows = session.exec(select(JobPosting).where(
+        JobPosting.owner_id == _uid(),
+        JobPosting.is_archived == False,  # noqa: E712
+    )).all()
+    marked = 0
+    for j in rows:
+        seen = getattr(j, "last_seen_at", None) or j.imported_at
+        stale_now = bool(seen and seen < cutoff)
+        currently = bool(getattr(j, "is_stale", False))
+        if stale_now != currently:
+            try:
+                j.is_stale = stale_now
+                session.add(j)
+                if stale_now:
+                    marked += 1
+            except Exception:
+                pass
+    session.commit()
+    return {"marked_stale": marked, "cutoff": cutoff.isoformat()}
+
+
+# ── Phase 5: Saved Searches ───────────────────────────────────────────────
+class SavedSearchCreate(BaseModel):
+    name: str
+    query: str = ""
+    provider: Optional[str] = None
+    min_salary: Optional[int] = None
+    max_salary: Optional[int] = None
+    work_mode: Optional[str] = None
+    location_filter: Optional[str] = None
+    frequency: str = "manual"
+
+
+class SavedSearchUpdate(BaseModel):
+    name: Optional[str] = None
+    query: Optional[str] = None
+    provider: Optional[str] = None
+    min_salary: Optional[int] = None
+    max_salary: Optional[int] = None
+    work_mode: Optional[str] = None
+    location_filter: Optional[str] = None
+    frequency: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class SavedSearchRead(BaseModel):
+    id: str
+    owner_id: str
+    name: str
+    query: str
+    provider: Optional[str]
+    min_salary: Optional[int]
+    max_salary: Optional[int]
+    work_mode: Optional[str]
+    location_filter: Optional[str]
+    frequency: str
+    last_run_at: Optional[datetime]
+    created_at: datetime
+    is_active: bool
+
+
+class SavedSearchRunResult(BaseModel):
+    search_id: str
+    search_name: str
+    provider_used: str
+    jobs_fetched: int
+    jobs_created: int
+    jobs_skipped_dupes: int
+    last_run_at: str
+
+
+def _ss_read(ss: SavedSearch) -> SavedSearchRead:
+    return SavedSearchRead(
+        id=ss.id, owner_id=ss.owner_id, name=ss.name, query=ss.query,
+        provider=ss.provider, min_salary=ss.min_salary,
+        max_salary=ss.max_salary, work_mode=ss.work_mode,
+        location_filter=ss.location_filter, frequency=ss.frequency,
+        last_run_at=ss.last_run_at, created_at=ss.created_at,
+        is_active=ss.is_active)
+
+
+@_ss_router.get("", response_model=List[SavedSearchRead])
+def list_saved_searches(session: Session = Depends(get_session)):
+    rows = session.exec(select(SavedSearch).where(
+        SavedSearch.owner_id == _uid()
+    ).order_by(SavedSearch.created_at.desc())).all()
+    return [_ss_read(ss) for ss in rows]
+
+
+@_ss_router.post("", response_model=SavedSearchRead, status_code=201)
+def create_saved_search(body: SavedSearchCreate,
+                        session: Session = Depends(get_session)):
+    if not (body.name or "").strip():
+        raise HTTPException(400, "name is required")
+    freq = (body.frequency or "manual").lower()
+    if freq not in ("manual", "daily", "weekly"):
+        raise HTTPException(400, "frequency must be manual|daily|weekly")
+    ss = SavedSearch(
+        owner_id=_uid(), name=body.name.strip(), query=body.query or "",
+        provider=body.provider or None, min_salary=body.min_salary,
+        max_salary=body.max_salary, work_mode=body.work_mode or None,
+        location_filter=body.location_filter or None,
+        frequency=freq, is_active=True)
+    session.add(ss)
+    session.commit()
+    session.refresh(ss)
+    return _ss_read(ss)
+
+
+@_ss_router.get("/{ss_id}", response_model=SavedSearchRead)
+def get_saved_search(ss_id: str, session: Session = Depends(get_session)):
+    ss = session.get(SavedSearch, ss_id)
+    if not ss or ss.owner_id != _uid():
+        raise HTTPException(404, "Saved search not found")
+    return _ss_read(ss)
+
+
+@_ss_router.patch("/{ss_id}", response_model=SavedSearchRead)
+def update_saved_search(ss_id: str, body: SavedSearchUpdate,
+                        session: Session = Depends(get_session)):
+    ss = session.get(SavedSearch, ss_id)
+    if not ss or ss.owner_id != _uid():
+        raise HTTPException(404, "Saved search not found")
+    for field, value in body.model_dump(exclude_unset=True).items():
+        if field == "frequency" and value:
+            value = value.lower()
+            if value not in ("manual", "daily", "weekly"):
+                raise HTTPException(
+                    400, "frequency must be manual|daily|weekly")
+        setattr(ss, field, value)
+    session.add(ss)
+    session.commit()
+    session.refresh(ss)
+    return _ss_read(ss)
+
+
+@_ss_router.delete("/{ss_id}", status_code=204)
+def delete_saved_search(ss_id: str,
+                        session: Session = Depends(get_session)):
+    ss = session.get(SavedSearch, ss_id)
+    if not ss or ss.owner_id != _uid():
+        raise HTTPException(404, "Saved search not found")
+    session.delete(ss)
+    session.commit()
+    return Response(status_code=204)
+
+
+@_ss_router.post("/{ss_id}/run", response_model=SavedSearchRunResult)
+def run_saved_search(ss_id: str, session: Session = Depends(get_session)):
+    """Fetch jobs using the saved search criteria and merge into job table."""
+    ss = session.get(SavedSearch, ss_id)
+    if not ss or ss.owner_id != _uid():
+        raise HTTPException(404, "Saved search not found")
+
+    provider_name = ss.provider or JOB_PROVIDER
+    _, raw_jobs = fetch_jobs_from_source(provider_name, ss.query or None, 50)
+
+    # Apply saved-search filters
+    filtered: List[JobPosting] = []
+    for j in raw_jobs:
+        if ss.min_salary and j.salary_min and j.salary_min < ss.min_salary:
+            continue
+        if ss.max_salary and j.salary_max and j.salary_max > ss.max_salary:
+            continue
+        if ss.work_mode and j.work_mode.value != ss.work_mode:
+            continue
+        if ss.location_filter:
+            if ss.location_filter.lower() not in (j.location or "").lower():
+                continue
+        filtered.append(j)
+
+    # Merge with cross-provider deduplication
+    existing = {(j.title.lower(), j.company.lower())
+                for j in session.exec(select(JobPosting).where(
+                    JobPosting.owner_id == _uid())).all()}
+    created = 0
+    skipped = 0
+    for j in filtered:
+        k = (j.title.lower(), j.company.lower())
+        if k in existing:
+            dup = _find_duplicate(session, j.company, j.title, j.source_url)
+            if dup:
+                try:
+                    dup.last_seen_at = _now()
+                    dup.is_stale = False
+                    session.add(dup)
+                except Exception:
+                    pass
+            skipped += 1
+        else:
+            existing.add(k)
+            j.owner_id = _uid()
+            session.add(j)
+            created += 1
+
+    ss.last_run_at = _now()
+    session.add(ss)
+    session.commit()
+    return SavedSearchRunResult(
+        search_id=ss.id, search_name=ss.name,
+        provider_used=provider_name,
+        jobs_fetched=len(filtered), jobs_created=created,
+        jobs_skipped_dupes=skipped,
+        last_run_at=ss.last_run_at.isoformat())
+
+
+# Register both routers (this is the line that makes the routes live)
+app.include_router(_jobs_p5_router)
+app.include_router(_ss_router)

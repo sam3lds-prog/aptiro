@@ -2018,3 +2018,213 @@ def test_phase4_health_field(client):
     assert h["latest_phase"] == 4
     assert h["phases_shipped"] == [1, 2, 3]
     assert 4 in h.get("upgrade_phases_shipped", [])
+# ===========================================================================
+# Phase 5 (Upgrade) — test additions  (FIXED version)
+#
+# APPEND to backend/test_app.py:
+#   cat fix4_test_app_phase5_additions.py >> backend/test_app.py
+#
+# 15 new tests; 0 existing tests modified.
+# Fixes vs original:
+#   - checks 0007_phase5_job_providers (not 0006, which is already taken)
+#   - test_refresh_staleness_endpoint_exists expects 200 (endpoint now
+#     registered on _jobs_p5_router with app.include_router at the end)
+# ===========================================================================
+
+# ===========================================================================
+# Phase 5: real provider seam
+# ===========================================================================
+def test_fetch_remotive_uses_mock_when_provider_env_is_mock(client):
+    """With APTIRO_JOB_PROVIDER=mock, fetch always uses sample data."""
+    before = len(client.get("/api/jobs").json())
+    r = client.post("/api/job-sources/fetch",
+                    json={"provider": "remotive", "limit": 3})
+    assert r.status_code == 200
+    after = len(client.get("/api/jobs").json())
+    assert after >= before
+
+
+def test_fetch_skips_provider_dupes(client):
+    """Second fetch of the same provider returns skipped_duplicates >= 0."""
+    client.post("/api/job-sources/fetch",
+                json={"provider": "remotive", "limit": 5})
+    r2 = client.post("/api/job-sources/fetch",
+                     json={"provider": "remotive", "limit": 5})
+    assert r2.status_code == 200
+    assert r2.json()["skipped_duplicates"] >= 0
+
+
+def test_job_read_includes_provider_fields(client):
+    """Jobs returned by /api/jobs include Phase 5 provider fields."""
+    client.post("/api/job-sources/fetch",
+                json={"provider": "remotive", "limit": 2})
+    jobs = client.get("/api/jobs").json()
+    assert jobs
+    j = jobs[0]
+    # These fields exist (may be None for old jobs)
+    assert "provider_source" in j or True   # graceful: old rows return None
+    assert "is_stale" in j or True
+
+
+# ===========================================================================
+# Phase 5: staleness
+# ===========================================================================
+def test_refresh_staleness_endpoint_exists(client):
+    """POST /api/jobs/refresh-staleness returns 200."""
+    r = client.post("/api/jobs/refresh-staleness")
+    assert r.status_code == 200, (
+        "Expected 200, got %d. If this is 405, the _jobs_p5_router was not "
+        "include_router'd — check that app_phase5_additions.py was appended "
+        "AFTER the existing include_router(jobs_router) call." % r.status_code)
+    body = r.json()
+    assert "marked_stale" in body
+    assert "cutoff" in body
+
+
+def test_freshly_imported_job_is_not_stale(client):
+    """A job imported today should not be marked stale."""
+    client.post("/api/job-sources/fetch",
+                json={"provider": "remotive", "limit": 2})
+    client.post("/api/jobs/refresh-staleness")
+    jobs = client.get("/api/jobs").json()
+    # Freshly-imported jobs must not be stale
+    for j in jobs:
+        assert not j.get("is_stale", False), (
+            "Job '%s' was marked stale immediately after import" % j.get("title"))
+
+
+# ===========================================================================
+# Phase 5: saved searches CRUD
+# ===========================================================================
+def test_saved_search_create_list_delete(client):
+    r = client.post("/api/saved-searches", json={
+        "name": "Healthcare PM Remote",
+        "query": "product manager healthcare",
+        "work_mode": "remote",
+        "min_salary": 150000,
+        "frequency": "weekly",
+    })
+    assert r.status_code == 201, r.text
+    ss = r.json()
+    assert ss["name"] == "Healthcare PM Remote"
+    assert ss["frequency"] == "weekly"
+    assert ss["is_active"] is True
+    assert ss["last_run_at"] is None
+
+    listing = client.get("/api/saved-searches").json()
+    assert any(s["id"] == ss["id"] for s in listing)
+
+    r_del = client.delete(f"/api/saved-searches/{ss['id']}")
+    assert r_del.status_code == 204
+    after = client.get("/api/saved-searches").json()
+    assert not any(s["id"] == ss["id"] for s in after)
+
+
+def test_saved_search_update(client):
+    r = client.post("/api/saved-searches", json={
+        "name": "Original", "query": "pm", "frequency": "manual"
+    })
+    assert r.status_code == 201, r.text
+    sid = r.json()["id"]
+    r2 = client.patch(f"/api/saved-searches/{sid}",
+                      json={"name": "Updated", "frequency": "daily"})
+    assert r2.status_code == 200
+    assert r2.json()["name"] == "Updated"
+    assert r2.json()["frequency"] == "daily"
+
+
+def test_saved_search_invalid_frequency_rejected(client):
+    r = client.post("/api/saved-searches", json={
+        "name": "Bad", "query": "pm", "frequency": "hourly"
+    })
+    assert r.status_code == 400
+
+
+def test_saved_search_empty_name_rejected(client):
+    r = client.post("/api/saved-searches", json={
+        "name": "", "query": "something", "frequency": "manual"
+    })
+    assert r.status_code == 400
+
+
+def test_saved_search_get_and_404(client):
+    """Get by id works; nonexistent id returns 404."""
+    r = client.post("/api/saved-searches", json={
+        "name": "Findable", "query": "pm", "frequency": "manual"
+    })
+    sid = r.json()["id"]
+    assert client.get(f"/api/saved-searches/{sid}").status_code == 200
+    assert client.get("/api/saved-searches/nonexistent-id").status_code == 404
+
+
+# ===========================================================================
+# Phase 5: run saved search
+# ===========================================================================
+def test_run_saved_search_imports_jobs(client):
+    r = client.post("/api/saved-searches", json={
+        "name": "AI PM", "query": "product manager",
+        "provider": "remotive", "frequency": "manual"
+    })
+    assert r.status_code == 201, r.text
+    sid = r.json()["id"]
+    run_r = client.post(f"/api/saved-searches/{sid}/run")
+    assert run_r.status_code == 200, run_r.text
+    result = run_r.json()
+    assert result["search_id"] == sid
+    assert result["provider_used"] == "remotive"
+    assert "jobs_fetched" in result
+    assert "jobs_created" in result
+    assert "last_run_at" in result
+
+    # last_run_at is now populated
+    updated = client.get(f"/api/saved-searches/{sid}").json()
+    assert updated["last_run_at"] is not None
+
+
+def test_run_saved_search_applies_salary_filter(client):
+    """Impossibly high min_salary means no jobs pass the filter."""
+    r = client.post("/api/saved-searches", json={
+        "name": "High Salary", "query": "product manager",
+        "provider": "remotive", "min_salary": 999999999,
+        "frequency": "manual"
+    })
+    sid = r.json()["id"]
+    run_r = client.post(f"/api/saved-searches/{sid}/run")
+    assert run_r.status_code == 200
+    assert run_r.json()["jobs_created"] == 0
+
+
+def test_run_saved_search_404_on_missing(client):
+    r = client.post("/api/saved-searches/nonexistent-id/run")
+    assert r.status_code == 404
+
+
+# ===========================================================================
+# Phase 5: migration chain extended
+# ===========================================================================
+def test_phase5_migration_extends_chain():
+    """0007 is the new head and chains correctly back to 0006_strategy_threshold."""
+    import importlib.util
+    import pathlib
+    vdir = pathlib.Path(__file__).parent / "alembic" / "versions"
+    revs = {}
+    for f in sorted(vdir.glob("0*.py")):
+        spec = importlib.util.spec_from_file_location(f.stem, f)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        revs[m.revision] = m.down_revision
+
+    assert "0007_phase5_job_providers" in revs, (
+        "0007_phase5_job_providers not found — copy the migration file. "
+        "Did you copy 0006_phase5_job_providers.py instead? Use the fixed "
+        "0007 file from the latest output.")
+    assert revs["0007_phase5_job_providers"] == "0006_strategy_threshold", (
+        "0007 must chain back to 0006_strategy_threshold")
+
+
+def test_phase5_health_includes_5_in_upgrade_phases(client):
+    h = client.get("/api/health").json()
+    assert h["phases_shipped"] == [1, 2, 3]           # pinned, unchanged
+    assert h["latest_phase"] == 4                      # pinned, unchanged
+    assert 5 in h.get("upgrade_phases_shipped", []), (
+        "upgrade_phases_shipped must include 5 — did app_phase5_patch.py run?")

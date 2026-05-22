@@ -17,6 +17,8 @@ import { Activity } from "@/pages/Activity";
 import { Privacy } from "@/pages/Privacy";
 import { Auth } from "@/pages/Auth";
 import { NotFound } from "@/pages/NotFound";
+// Phase 5
+import { SavedSearches } from "@/pages/SavedSearches";
 
 type Boot = "loading" | "ready" | "auth";
 
@@ -48,16 +50,15 @@ export default function App() {
           if (!cancelled) setBoot("auth");
         }
       } catch {
-        // API is unreachable — fall through so pages can show their own
-        // error states rather than blocking the whole shell.
         if (!cancelled) setBoot("ready");
-        notify.error("Couldn't reach the Aptiro API. Is the backend running on :8000?");
+        notify.error(
+          "Couldn't reach the Aptiro API. Is the backend running on :8000?"
+        );
       }
     })();
     return () => {
       cancelled = true;
     };
-    // setMe/setAuth are stable Zustand bindings; intentional empty deps
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -94,6 +95,8 @@ export default function App() {
         <Route path="/apply" element={<Apply />} />
         <Route path="/activity" element={<Activity />} />
         <Route path="/privacy" element={<Privacy />} />
+        {/* Phase 5 */}
+        <Route path="/saved-searches" element={<SavedSearches />} />
         <Route path="/dash" element={<Navigate to="/" replace />} />
         <Route path="*" element={<NotFound />} />
       </Route>
