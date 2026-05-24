@@ -6011,8 +6011,13 @@ def _generate_research_queries(
                 cids[:5],
             )
 
-        # Absolute last resort: one generic PM trend query
-        if not queries:
+        # Absolute last resort: one generic PM trend query.
+        # Only fires when there ARE claims but their structured fields
+        # (company, role, skills) are all blank — e.g. the mock extractor
+        # left them empty.  Guard: skip entirely when claims is empty so
+        # that calling run_profile_contributions with zero approved claims
+        # correctly returns findings_created=0.
+        if not queries and claims:
             all_cids = [c.id for c in claims[:5]]
             _add(
                 "senior product manager AI healthcare 2026",
