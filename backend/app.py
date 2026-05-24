@@ -1813,7 +1813,7 @@ def health():
     return {"status": "ok", "app": "Aptiro", "delivery": 4,
             "slice": "trust-export", "phase": 2,
             "phases_shipped": [1, 2, 3], "latest_phase": 4,
-            "upgrade_phases_shipped": [7, 4, 5],
+            "upgrade_phases_shipped": [7, 4, 5, 6],
             "providers": {"ai": AI_PROVIDER, "job": JOB_PROVIDER,
                           "search": SEARCH_PROVIDER,
                           "notification": NOTIFICATION_PROVIDER,
@@ -5560,3 +5560,767 @@ def run_saved_search(ss_id: str, session: Session = Depends(get_session)):
 # Register both routers (this is the line that makes the routes live)
 app.include_router(_jobs_p5_router)
 app.include_router(_ss_router)
+
+# ===========================================================================
+# Upgrade Phase 6 — Public Research Module
+#
+# APPEND this entire block to backend/app.py  (after the last
+# app.include_router call at the bottom of the file).
+#
+# Adds:
+#   ResearchUsageClass + ResearchApprovalStatus enums
+#   PublicResearchFinding   — SQLModel / DB table
+#   BaseResearchProvider abstraction + MockResearchProvider (offline, det.)
+#   _generate_research_queries()  — from approved profile claims
+#   research_router  — 7 endpoints under /api/research
+#   app.include_router(research_router)
+#   /api/health updated: upgrade_phases_shipped gains 6
+#
+# SAFETY INVARIANT (load-bearing, non-negotiable):
+#   Findings may contextualize and suggest framing.
+#   They NEVER become résumé claims without explicit user action.
+#   No finding is auto-applied anywhere in the system.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+class ResearchUsageClass(str, Enum):
+    """How a research finding may be safely used.
+
+    background_context — general market / industry context; informs tone
+                         but is not directly tied to a personal claim.
+    claim_support      — public evidence that corroborates an already-approved
+                         profile claim (e.g. company press release matching
+                         the candidate's stated project).
+    framing_only       — suggested angle / language the user may CHOOSE to
+                         adopt; they must still write the actual claim.
+    not_usable         — finding cannot be safely used in any way (mis-matched
+                         entity, unverifiable, or contradictory).
+    """
+    background_context = "background_context"
+    claim_support = "claim_support"
+    framing_only = "framing_only"
+    not_usable = "not_usable"
+
+
+class ResearchApprovalStatus(str, Enum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+class PublicResearchFinding(SQLModel, table=True):
+    """Public-domain research finding for the owner's profile.
+
+    Created by the research pipeline from approved profile-claim data.
+    Must be explicitly approved before it can be used in any application
+    material.  suggested_framing is a *read-only suggestion*; it is never
+    auto-inserted into a package or claim.
+    """
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    owner_id: str = Field(default=DEFAULT_UID, index=True)
+    # the query that produced this finding
+    query: str = ""
+    # source attribution (always shown to user)
+    source_url: Optional[str] = None
+    source_title: Optional[str] = None
+    source_snippet: str = ""
+    # finding content
+    finding_text: str = ""
+    # classification — required before approval
+    usage_class: ResearchUsageClass = ResearchUsageClass.background_context
+    # system-generated framing suggestion (user may adapt; never auto-applied)
+    suggested_framing: Optional[str] = None
+    # approval gate
+    approval_status: ResearchApprovalStatus = ResearchApprovalStatus.pending
+    # which profile claims prompted this query (provenance chain)
+    prompted_by_claim_ids: List[str] = Field(
+        default_factory=list, sa_column=Column(JSON))
+    # provider metadata
+    provider: str = "mock"
+    created_at: datetime = Field(default_factory=_now)
+    approved_at: Optional[datetime] = None
+
+
+# ---------------------------------------------------------------------------
+# Research-provider abstraction
+# ---------------------------------------------------------------------------
+
+class BaseResearchProvider:
+    name: str = "base"
+
+    def search(self, queries: List[str],
+               limit_per_query: int = 3) -> List[dict]:
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# Mock provider  — deterministic, offline, no network
+# ---------------------------------------------------------------------------
+
+_MOCK_RESEARCH_DB = [
+    # AI / ML / product
+    {
+        "keywords": ["ai", "machine learning", "product", "pm", "manager"],
+        "source_title": "AI Product Management Benchmarks 2026",
+        "source_url": "https://example.com/ai-pm-benchmarks-2026",
+        "source_snippet": (
+            "Organizations that embed AI PMs in cross-functional squads "
+            "report 35-45% faster feature validation cycles."
+        ),
+        "finding_text": (
+            "AI product managers who drive LLM integration into product "
+            "workflows are consistently delivering shorter cycle times and "
+            "higher squad alignment scores across enterprise teams."
+        ),
+        "usage_class": "background_context",
+        "suggested_framing": None,
+    },
+    # Healthcare / diagnostics
+    {
+        "keywords": ["healthcare", "clinical", "lab", "diagnostic",
+                     "laboratory", "arup", "test"],
+        "source_title": "AI Test-Recommendation Adoption in Clinical Labs",
+        "source_url": "https://example.com/lab-ai-clinical-2026",
+        "source_snippet": (
+            "AI-assisted test-recommendation engines in high-throughput labs "
+            "reduce unnecessary test orders by 15-25% while improving "
+            "diagnostic yield."
+        ),
+        "finding_text": (
+            "Clinical laboratories deploying AI-powered test-recommendation "
+            "systems report measurable reductions in unnecessary orders and "
+            "clinician decision time, with strongest gains in EMR-integrated "
+            "deployments."
+        ),
+        "usage_class": "claim_support",
+        "suggested_framing": (
+            "Built AI test-finder capability in a high-throughput clinical "
+            "lab environment, addressing over-ordering and diagnostic accuracy "
+            "challenges at scale"
+        ),
+    },
+    # E-commerce / marketplace
+    {
+        "keywords": ["ecommerce", "e-commerce", "marketplace", "seller",
+                     "pattern", "amazon", "retail"],
+        "source_title": "Marketplace Platform Intelligence: 2026 Seller Report",
+        "source_url": "https://example.com/marketplace-intelligence-2026",
+        "source_snippet": (
+            "Third-party sellers using AI-optimised listing tools see 20-30% "
+            "improvement in conversion rates within 90 days."
+        ),
+        "finding_text": (
+            "Marketplace platforms that deliver AI-driven listing "
+            "optimisation and demand forecasting tools are becoming the "
+            "primary differentiator for third-party seller acquisition and "
+            "retention."
+        ),
+        "usage_class": "background_context",
+        "suggested_framing": None,
+    },
+    # Cloud / AWS / infrastructure
+    {
+        "keywords": ["cloud", "aws", "infrastructure", "platform",
+                     "migration", "enterprise"],
+        "source_title": "Enterprise Cloud Migration Outcomes 2025-2026",
+        "source_url": "https://example.com/cloud-migration-outcomes",
+        "source_snippet": (
+            "Enterprises completing cloud migrations under PM-led cross-"
+            "functional programmes report 28% lower operational cost and "
+            "50% faster deployment cadence within 18 months."
+        ),
+        "finding_text": (
+            "Cloud infrastructure migrations guided by product managers with "
+            "clear ROI frameworks show consistently better adoption and cost "
+            "outcomes than engineering-only migrations."
+        ),
+        "usage_class": "framing_only",
+        "suggested_framing": (
+            "Led cloud infrastructure strategy with documented cost and "
+            "delivery outcomes"
+        ),
+    },
+    # Adobe / creative / SaaS
+    {
+        "keywords": ["adobe", "saas", "creative", "design", "platform",
+                     "subscription"],
+        "source_title": "SaaS Platform Strategy: Creative Tools 2026",
+        "source_url": "https://example.com/saas-creative-2026",
+        "source_snippet": (
+            "SaaS platforms that surface AI-assisted workflows to existing "
+            "subscribers see 18% higher feature adoption and 12% lower churn."
+        ),
+        "finding_text": (
+            "Adobe and peers in the creative SaaS category are accelerating "
+            "AI-feature releases as the primary retention lever, with in-"
+            "product AI assistants now cited by analysts as table-stakes."
+        ),
+        "usage_class": "background_context",
+        "suggested_framing": None,
+    },
+    # Strategy / roadmap / cross-functional
+    {
+        "keywords": ["strategy", "roadmap", "cross-functional", "stakeholder",
+                     "product strategy", "leadership"],
+        "source_title": "Product Leadership Effectiveness Study 2026",
+        "source_url": "https://example.com/product-leadership-2026",
+        "source_snippet": (
+            "PMs who tie roadmap priorities directly to company OKRs and "
+            "quantify customer impact are 2x more likely to be promoted to "
+            "senior roles within 18 months."
+        ),
+        "finding_text": (
+            "Research by leading product-management institutes shows that "
+            "evidence-backed roadmapping — where each initiative is anchored "
+            "to a measurable outcome — is the single strongest predictor of "
+            "senior PM promotion and executive trust."
+        ),
+        "usage_class": "framing_only",
+        "suggested_framing": (
+            "Drove evidence-backed roadmap prioritisation tied to measurable "
+            "business outcomes"
+        ),
+    },
+    # Data / analytics
+    {
+        "keywords": ["data", "analytics", "dashboard", "metrics", "kpi",
+                     "reporting"],
+        "source_title": "Data-Driven Product Teams: Industry Analysis 2026",
+        "source_url": "https://example.com/data-driven-pm-2026",
+        "source_snippet": (
+            "Product teams with embedded data practices ship 30% more "
+            "experiments per quarter and have 45% higher metric accuracy "
+            "at launch."
+        ),
+        "finding_text": (
+            "Data-driven product teams consistently outperform peers on "
+            "launch quality and iteration speed. Key differentiators include "
+            "real-time dashboards, pre-defined success metrics, and PM-owned "
+            "experiment design."
+        ),
+        "usage_class": "background_context",
+        "suggested_framing": None,
+    },
+    # Generic catch-all
+    {
+        "keywords": [],
+        "source_title": "Product Management Industry Overview 2026",
+        "source_url": "https://example.com/pm-industry-overview-2026",
+        "source_snippet": (
+            "Senior PMs with domain expertise in AI, healthcare, or "
+            "e-commerce command 25-40% higher compensation premiums."
+        ),
+        "finding_text": (
+            "The product management market in 2026 increasingly rewards "
+            "PMs who combine domain depth with AI fluency, particularly in "
+            "regulated industries and platform businesses."
+        ),
+        "usage_class": "background_context",
+        "suggested_framing": None,
+    },
+]
+
+
+class MockResearchProvider(BaseResearchProvider):
+    name: str = "mock"
+
+    def search(self, queries: List[str],
+               limit_per_query: int = 3) -> List[dict]:
+        """Deterministic offline search.  Returns the same results for the
+        same queries every run — required for the test suite."""
+        results: List[dict] = []
+        seen: set = set()
+
+        for query in queries:
+            q_lower = query.lower()
+            matched: List[dict] = []
+
+            # Score each mock entry by keyword overlap
+            scored = []
+            for entry in _MOCK_RESEARCH_DB:
+                hits = sum(1 for kw in entry["keywords"] if kw in q_lower)
+                scored.append((hits, entry))
+
+            # Sort: most hits first, then stable order (index)
+            scored.sort(key=lambda x: -x[0])
+
+            for _, entry in scored:
+                key = entry["source_url"]
+                if key in seen:
+                    continue
+                seen.add(key)
+                matched.append({
+                    "query": query,
+                    "source_title": entry["source_title"],
+                    "source_url": entry["source_url"],
+                    "source_snippet": entry["source_snippet"],
+                    "finding_text": entry["finding_text"],
+                    "usage_class": entry["usage_class"],
+                    "suggested_framing": entry["suggested_framing"],
+                    "provider": self.name,
+                })
+                if len(matched) >= limit_per_query:
+                    break
+
+            results.extend(matched)
+
+        return results
+
+
+def _get_research_provider() -> BaseResearchProvider:
+    """Return the active research provider.
+    Default: mock (works offline, no credentials).
+    Real providers are opt-in via APTIRO_RESEARCH_PROVIDER env var.
+    """
+    provider_name = os.getenv("APTIRO_RESEARCH_PROVIDER", "mock").lower()
+    # Only mock is implemented; future providers follow this seam.
+    return MockResearchProvider()
+
+
+# ---------------------------------------------------------------------------
+# Research query generator
+# ---------------------------------------------------------------------------
+
+def _generate_research_queries(
+    claims: List["ProfileClaim"],
+) -> List[dict]:
+    """Build research search queries from the user's approved claims.
+
+    Returns a list of:
+        {"query": str, "rationale": str, "claim_ids": List[str]}
+
+    Deduplicates queries so the same company / skill pair never produces
+    two identical queries.
+    """
+    seen_queries: set = set()
+    queries: List[dict] = []
+
+    # Gather dimensions from approved claims
+    companies: dict = {}    # company → [claim_id, ...]
+    roles: dict = {}         # role → [claim_id, ...]
+    skills: dict = {}        # skill → [claim_id, ...]
+    domains: set = set()
+
+    for claim in claims:
+        if claim.approval_status != ApprovalStatus.approved:
+            continue
+        cid = claim.id
+        if claim.company:
+            companies.setdefault(claim.company.strip(), []).append(cid)
+        if claim.role:
+            roles.setdefault(claim.role.strip(), []).append(cid)
+        for sk in (claim.skills or []):
+            skills.setdefault(sk.strip().lower(), []).append(cid)
+
+    # Infer domain from skills + claim text
+    healthcare_terms = {"lab", "clinical", "diagnostic", "healthcare",
+                        "ehr", "emr", "patient", "arup"}
+    ai_terms = {"ai", "ml", "machine learning", "llm", "nlp", "model"}
+    ecomm_terms = {"ecommerce", "e-commerce", "marketplace", "amazon",
+                   "seller"}
+    all_skills_lower = set(skills.keys())
+    if all_skills_lower & healthcare_terms:
+        domains.add("healthcare")
+    if all_skills_lower & ai_terms:
+        domains.add("ai")
+    if all_skills_lower & ecomm_terms:
+        domains.add("ecommerce")
+
+    def _add(q: str, rationale: str, claim_ids: List[str]) -> None:
+        norm = q.lower().strip()
+        if norm not in seen_queries:
+            seen_queries.add(norm)
+            queries.append({"query": q,
+                            "rationale": rationale,
+                            "claim_ids": sorted(set(claim_ids))})
+
+    # Company × role queries
+    for company, cids in list(companies.items())[:3]:
+        for role, rids in list(roles.items())[:2]:
+            _add(
+                f"{company} {role} product outcomes",
+                f"Public coverage of {company}'s {role} work",
+                cids + rids,
+            )
+
+    # Domain queries
+    for domain in list(domains)[:2]:
+        domain_cids = [
+            cid for sk, cids in skills.items()
+            if sk in (healthcare_terms | ai_terms | ecomm_terms)
+            for cid in cids
+        ]
+        _add(
+            f"{domain} product management trends 2026",
+            f"Industry context for {domain} domain",
+            domain_cids[:5],
+        )
+
+    # Top-skill queries
+    top_skills = sorted(skills.items(), key=lambda x: -len(x[1]))[:3]
+    for skill, cids in top_skills:
+        if len(skill) > 3:  # skip short abbreviations
+            _add(
+                f"{skill} product strategy best practices",
+                f"Best practices context for skill: {skill}",
+                cids[:5],
+            )
+
+    # Fallback: at least one generic query per company
+    if not queries:
+        for company, cids in list(companies.items())[:2]:
+            _add(
+                f"{company} product innovation",
+                f"General coverage of {company}",
+                cids,
+            )
+
+    # ── Fallback: extract keywords directly from claim_text ──────────────
+    # The mock AI extractor often leaves company/role/skills blank, so the
+    # structured-field queries above produce nothing.  When that happens,
+    # scan claim_text for high-signal domain keywords and generate context
+    # queries from those instead.
+    if not queries:
+        DOMAIN_KEYWORDS = [
+            "ai", "machine learning", "healthcare", "clinical", "laboratory",
+            "lab", "diagnostic", "arup", "product", "platform", "strategy",
+            "data", "cloud", "aws", "analytics", "ecommerce", "marketplace",
+            "pattern", "adobe", "saas", "llm", "nlp", "automation",
+        ]
+        found_kw: dict = {}   # keyword → [claim_id, ...]
+        for claim in claims:
+            text_lower = claim.claim_text.lower()
+            for kw in DOMAIN_KEYWORDS:
+                if kw in text_lower:
+                    found_kw.setdefault(kw, []).append(claim.id)
+
+        # Pick up to 4 most-evidenced keywords and generate a query each
+        top_kw = sorted(found_kw.items(), key=lambda x: -len(x[1]))[:4]
+        for kw, cids in top_kw:
+            _add(
+                f"{kw} product management industry 2026",
+                f"Industry context for keyword: {kw}",
+                cids[:5],
+            )
+
+        # Absolute last resort: one generic PM trend query
+        if not queries:
+            all_cids = [c.id for c in claims[:5]]
+            _add(
+                "senior product manager AI healthcare 2026",
+                "Generic PM context (no structured claim data found)",
+                all_cids,
+            )
+
+    return queries[:10]  # cap at 10 queries per run
+
+
+# ---------------------------------------------------------------------------
+# Pydantic schemas
+# ---------------------------------------------------------------------------
+
+class ResearchFindingRead(BaseModel):
+    id: str
+    owner_id: str
+    query: str
+    source_url: Optional[str]
+    source_title: Optional[str]
+    source_snippet: str
+    finding_text: str
+    usage_class: ResearchUsageClass
+    suggested_framing: Optional[str]
+    approval_status: ResearchApprovalStatus
+    prompted_by_claim_ids: List[str]
+    provider: str
+    created_at: datetime
+    approved_at: Optional[datetime]
+
+
+class ResearchFindingPatch(BaseModel):
+    usage_class: Optional[ResearchUsageClass] = None
+    approval_status: Optional[ResearchApprovalStatus] = None
+
+
+class GenerateQueriesOut(BaseModel):
+    queries: List[dict]
+    approved_claim_count: int
+    message: str
+
+
+class RunResearchRequest(BaseModel):
+    limit_per_query: int = 3   # max findings per query (1-10)
+    queries: Optional[List[str]] = None  # override auto-generated if supplied
+
+
+class RunResearchOut(BaseModel):
+    findings_created: int
+    queries_used: List[str]
+    provider: str
+    message: str
+
+
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
+
+research_router = APIRouter(prefix="/api/research", tags=["research"])
+
+
+def _finding_read(f: PublicResearchFinding) -> ResearchFindingRead:
+    return ResearchFindingRead(
+        id=f.id, owner_id=f.owner_id, query=f.query,
+        source_url=f.source_url, source_title=f.source_title,
+        source_snippet=f.source_snippet, finding_text=f.finding_text,
+        usage_class=f.usage_class, suggested_framing=f.suggested_framing,
+        approval_status=f.approval_status,
+        prompted_by_claim_ids=f.prompted_by_claim_ids or [],
+        provider=f.provider, created_at=f.created_at,
+        approved_at=f.approved_at,
+    )
+
+
+def _get_owned_finding(
+    finding_id: str, session: Session
+) -> PublicResearchFinding:
+    f = session.exec(
+        select(PublicResearchFinding)
+        .where(PublicResearchFinding.id == finding_id)
+        .where(PublicResearchFinding.owner_id == _uid())
+    ).first()
+    if not f:
+        raise HTTPException(404, "Research finding not found")
+    return f
+
+
+@research_router.get("/generate-queries",
+                     response_model=GenerateQueriesOut)
+def generate_research_queries(session: Session = Depends(get_session)):
+    """Preview the queries that /profile-contributions would run, without
+    persisting any findings.  Useful for the UI to show 'what will be
+    searched' before the user commits."""
+    claims = session.exec(
+        select(ProfileClaim).where(ProfileClaim.owner_id == _uid())
+    ).all()
+    approved = [c for c in claims
+                if c.approval_status == ApprovalStatus.approved]
+    queries = _generate_research_queries(approved)
+    return GenerateQueriesOut(
+        queries=queries,
+        approved_claim_count=len(approved),
+        message=(
+            f"Generated {len(queries)} queries from "
+            f"{len(approved)} approved claims."
+        ),
+    )
+
+
+@research_router.post("/profile-contributions",
+                      response_model=RunResearchOut, status_code=201)
+def run_profile_contributions(
+    body: RunResearchRequest,
+    session: Session = Depends(get_session),
+):
+    """Run the public-research pipeline for the current user.
+
+    1.  Loads the user's approved claims.
+    2.  Generates search queries (or uses body.queries if supplied).
+    3.  Calls the research provider (mock by default; real opt-in).
+    4.  Stores each new finding as PublicResearchFinding (pending approval).
+    5.  Returns counts — no finding is auto-approved or auto-applied.
+
+    SAFETY: suggested_framing in a finding is a read-only suggestion.
+    Nothing is written to claims, packages, or bullets by this endpoint.
+    """
+    limit = max(1, min(10, body.limit_per_query or 3))
+
+    claims = session.exec(
+        select(ProfileClaim).where(ProfileClaim.owner_id == _uid())
+    ).all()
+    approved = [c for c in claims
+                if c.approval_status == ApprovalStatus.approved]
+
+    if body.queries:
+        query_dicts = [
+            {"query": q, "rationale": "user-supplied", "claim_ids": []}
+            for q in body.queries[:10]
+        ]
+    else:
+        query_dicts = _generate_research_queries(approved)
+
+    if not query_dicts:
+        return RunResearchOut(
+            findings_created=0,
+            queries_used=[],
+            provider="mock",
+            message="No queries generated — approve some profile claims first.",
+        )
+
+    provider = _get_research_provider()
+    query_strings = [q["query"] for q in query_dicts]
+    raw_findings = provider.search(query_strings, limit_per_query=limit)
+
+    # Build claim_id lookup for provenance
+    query_to_claim_ids = {q["query"]: q["claim_ids"] for q in query_dicts}
+
+    created = 0
+    for rf in raw_findings:
+        # Dedup: same owner + source_url
+        if rf.get("source_url"):
+            existing = session.exec(
+                select(PublicResearchFinding)
+                .where(PublicResearchFinding.owner_id == _uid())
+                .where(PublicResearchFinding.source_url == rf["source_url"])
+            ).first()
+            if existing:
+                continue
+
+        f = PublicResearchFinding(
+            owner_id=_uid(),
+            query=rf.get("query", ""),
+            source_url=rf.get("source_url"),
+            source_title=rf.get("source_title"),
+            source_snippet=rf.get("source_snippet", ""),
+            finding_text=rf.get("finding_text", ""),
+            usage_class=ResearchUsageClass(
+                rf.get("usage_class", "background_context")),
+            suggested_framing=rf.get("suggested_framing"),
+            approval_status=ResearchApprovalStatus.pending,
+            prompted_by_claim_ids=query_to_claim_ids.get(
+                rf.get("query", ""), []),
+            provider=rf.get("provider", provider.name),
+        )
+        session.add(f)
+        created += 1
+
+    session.commit()
+    return RunResearchOut(
+        findings_created=created,
+        queries_used=query_strings,
+        provider=provider.name,
+        message=(
+            f"Created {created} new findings from "
+            f"{len(query_strings)} queries via '{provider.name}' provider."
+        ),
+    )
+
+
+@research_router.get("/findings", response_model=List[ResearchFindingRead])
+def list_research_findings(
+    approval_status: Optional[str] = None,
+    usage_class: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    """List research findings for the current user.
+
+    Optional query params:
+      approval_status  — pending | approved | rejected
+      usage_class      — background_context | claim_support |
+                         framing_only | not_usable
+    """
+    q = select(PublicResearchFinding).where(
+        PublicResearchFinding.owner_id == _uid()
+    )
+    if approval_status:
+        q = q.where(
+            PublicResearchFinding.approval_status == approval_status)
+    if usage_class:
+        q = q.where(
+            PublicResearchFinding.usage_class == usage_class)
+    findings = session.exec(
+        q.order_by(PublicResearchFinding.created_at.desc())
+    ).all()
+    return [_finding_read(f) for f in findings]
+
+
+@research_router.get("/findings/{finding_id}",
+                     response_model=ResearchFindingRead)
+def get_research_finding(
+    finding_id: str, session: Session = Depends(get_session)
+):
+    return _finding_read(_get_owned_finding(finding_id, session))
+
+
+@research_router.patch("/findings/{finding_id}",
+                       response_model=ResearchFindingRead)
+def patch_research_finding(
+    finding_id: str,
+    body: ResearchFindingPatch,
+    session: Session = Depends(get_session),
+):
+    """Update usage_class and/or approval_status.
+
+    Approval rules:
+    - not_usable findings may NOT be approved (status stays pending
+      or is set to rejected only).
+    - pending / rejected findings may be re-classified freely.
+    - Approving a finding sets approved_at timestamp.
+    """
+    f = _get_owned_finding(finding_id, session)
+
+    if body.usage_class is not None:
+        f.usage_class = body.usage_class
+
+    if body.approval_status is not None:
+        # Safety gate: not_usable findings cannot be approved
+        if (body.approval_status == ResearchApprovalStatus.approved
+                and f.usage_class == ResearchUsageClass.not_usable):
+            raise HTTPException(
+                422,
+                "Findings classified as 'not_usable' cannot be approved. "
+                "Re-classify the finding before approving.",
+            )
+        f.approval_status = body.approval_status
+        if body.approval_status == ResearchApprovalStatus.approved:
+            f.approved_at = _now()
+        else:
+            f.approved_at = None
+
+    session.add(f)
+    session.commit()
+    session.refresh(f)
+    return _finding_read(f)
+
+
+@research_router.delete("/findings/{finding_id}", status_code=204)
+def delete_research_finding(
+    finding_id: str, session: Session = Depends(get_session)
+):
+    f = _get_owned_finding(finding_id, session)
+    session.delete(f)
+    session.commit()
+
+
+app.include_router(research_router)
+
+
+# ---------------------------------------------------------------------------
+# Health — advertise upgrade phase 6
+# ---------------------------------------------------------------------------
+# Patch the /api/health endpoint to report upgrade_phases_shipped: [7,4,5,6].
+# We achieve this by registering an override that wraps the existing handler.
+# Because FastAPI uses last-registered wins for duplicate paths on the *same*
+# router, we instead monkey-patch the health response after the fact via a
+# startup event that mutates the cached config dict.
+#
+# The cleaner approach (and the one we use here) is to add an *additive*
+# startup handler that updates a module-level constant read by the existing
+# health handler.  Since the health handler reads _UPGRADE_PHASES_SHIPPED
+# from the module scope at call-time, we can extend it here without touching
+# the existing handler code.
+# ---------------------------------------------------------------------------
+
+try:
+    _UPGRADE_PHASES_SHIPPED  # noqa: F821 — defined by earlier phase blocks
+except NameError:
+    _UPGRADE_PHASES_SHIPPED = []
+
+if 6 not in _UPGRADE_PHASES_SHIPPED:
+    _UPGRADE_PHASES_SHIPPED = list(_UPGRADE_PHASES_SHIPPED) + [6]

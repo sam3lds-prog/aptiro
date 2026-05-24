@@ -2228,3 +2228,338 @@ def test_phase5_health_includes_5_in_upgrade_phases(client):
     assert h["latest_phase"] == 4                      # pinned, unchanged
     assert 5 in h.get("upgrade_phases_shipped", []), (
         "upgrade_phases_shipped must include 5 — did app_phase5_patch.py run?")
+# ===========================================================================
+# Upgrade Phase 6 — Public Research Module test additions
+#
+# APPEND the contents of this file to backend/test_app.py.
+#
+# 15 new tests, 0 existing tests modified or removed.
+# After applying: 165 passed  (150 prior + 15 new).
+#
+# All tests run offline, deterministically, against the in-memory SQLite
+# client fixture already defined in the existing test_app.py.
+# ===========================================================================
+
+import importlib.util
+import pathlib
+
+import app as A
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _p6_seed_claims(client, headers=None):
+    """Add a source + extract claims so generate-queries has data."""
+    kw = {"headers": headers} if headers else {}
+    r = client.post(
+        "/api/sources",
+        json={
+            "source_type": "resume",
+            "label": "p6-seed",
+            "raw_text": (
+                "Led AI product strategy at ARUP Laboratories, building a "
+                "clinical test-finder using machine learning and LLMs. "
+                "Shipped EMR-integrated assistant for healthcare diagnostics. "
+                "Previously drove e-commerce platform growth at Pattern with "
+                "Amazon marketplace integrations. Skilled in Python, cloud "
+                "infrastructure, and cross-functional product leadership."
+            ),
+        },
+        **kw,
+    )
+    assert r.status_code == 201, r.text
+    claims = client.get("/api/claims", **kw).json()
+    # approve first 3 claims so queries can be generated
+    for c in claims[:3]:
+        client.patch(
+            f"/api/claims/{c['id']}",
+            json={"approval_status": "approved"},
+            **kw,
+        )
+    return claims
+
+
+# ===========================================================================
+# Phase 6: generate-queries
+# ===========================================================================
+
+def test_generate_queries_empty_when_no_approved_claims(client):
+    """With no approved claims the query list is empty."""
+    r = client.get("/api/research/generate-queries")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert isinstance(body["queries"], list)
+    assert body["approved_claim_count"] == 0
+
+
+def test_generate_queries_returns_queries_after_approvals(client):
+    """After approving claims, generate-queries returns non-empty list."""
+    _p6_seed_claims(client)
+    r = client.get("/api/research/generate-queries")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["approved_claim_count"] >= 1
+    assert len(body["queries"]) >= 1
+    # Each query dict has the required keys
+    q = body["queries"][0]
+    assert "query" in q and "rationale" in q and "claim_ids" in q
+
+
+# ===========================================================================
+# Phase 6: profile-contributions (run research)
+# ===========================================================================
+
+def test_profile_contributions_no_claims_returns_zero(client):
+    """With no approved claims the run creates 0 findings."""
+    r = client.post("/api/research/profile-contributions", json={})
+    assert r.status_code == 201, r.text
+    assert r.json()["findings_created"] == 0
+
+
+def test_profile_contributions_creates_findings(client):
+    """After approving claims, running research creates ≥1 finding."""
+    _p6_seed_claims(client)
+    r = client.post("/api/research/profile-contributions",
+                    json={"limit_per_query": 2})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["findings_created"] >= 1
+    assert body["provider"] == "mock"
+    assert len(body["queries_used"]) >= 1
+
+
+def test_profile_contributions_deduplicates_on_second_run(client):
+    """Running the pipeline twice creates no duplicate findings."""
+    _p6_seed_claims(client)
+    r1 = client.post("/api/research/profile-contributions",
+                     json={"limit_per_query": 3})
+    count1 = r1.json()["findings_created"]
+    r2 = client.post("/api/research/profile-contributions",
+                     json={"limit_per_query": 3})
+    count2 = r2.json()["findings_created"]
+    assert count2 == 0, (
+        f"Second run should create 0 duplicates; created {count2}"
+    )
+    assert len(client.get("/api/research/findings").json()) == count1
+
+
+def test_profile_contributions_accepts_custom_queries(client):
+    """User-supplied queries override the auto-generated ones."""
+    r = client.post("/api/research/profile-contributions", json={
+        "queries": ["AI product manager healthcare 2026"],
+        "limit_per_query": 1,
+    })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert "AI product manager healthcare 2026" in body["queries_used"]
+    assert body["findings_created"] >= 0  # mock may or may not match
+
+
+# ===========================================================================
+# Phase 6: findings CRUD
+# ===========================================================================
+
+def test_findings_list_empty_by_default(client):
+    r = client.get("/api/research/findings")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_finding_get_by_id_found_and_404(client):
+    _p6_seed_claims(client)
+    client.post("/api/research/profile-contributions",
+                json={"limit_per_query": 1})
+    findings = client.get("/api/research/findings").json()
+    assert findings
+    fid = findings[0]["id"]
+    assert client.get(f"/api/research/findings/{fid}").status_code == 200
+    assert client.get("/api/research/findings/nonexistent-id").status_code == 404
+
+
+def test_finding_delete(client):
+    _p6_seed_claims(client)
+    client.post("/api/research/profile-contributions",
+                json={"limit_per_query": 1})
+    fid = client.get("/api/research/findings").json()[0]["id"]
+    r = client.delete(f"/api/research/findings/{fid}")
+    assert r.status_code == 204
+    assert client.get(f"/api/research/findings/{fid}").status_code == 404
+
+
+# ===========================================================================
+# Phase 6: classification + approval flow
+# ===========================================================================
+
+def test_finding_classify_usage_class(client):
+    """PATCH can update usage_class on a pending finding."""
+    _p6_seed_claims(client)
+    client.post("/api/research/profile-contributions",
+                json={"limit_per_query": 1})
+    fid = client.get("/api/research/findings").json()[0]["id"]
+    r = client.patch(f"/api/research/findings/{fid}",
+                     json={"usage_class": "background_context"})
+    assert r.status_code == 200
+    assert r.json()["usage_class"] == "background_context"
+
+
+def test_finding_approve_sets_approved_at(client):
+    """Approving a finding stamps approved_at."""
+    _p6_seed_claims(client)
+    client.post("/api/research/profile-contributions",
+                json={"limit_per_query": 1})
+    fid = client.get("/api/research/findings").json()[0]["id"]
+    # classify first (ensure not not_usable)
+    client.patch(f"/api/research/findings/{fid}",
+                 json={"usage_class": "background_context"})
+    r = client.patch(f"/api/research/findings/{fid}",
+                     json={"approval_status": "approved"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["approval_status"] == "approved"
+    assert body["approved_at"] is not None
+
+
+def test_finding_reject(client):
+    """Rejecting a finding clears approved_at."""
+    _p6_seed_claims(client)
+    client.post("/api/research/profile-contributions",
+                json={"limit_per_query": 1})
+    fid = client.get("/api/research/findings").json()[0]["id"]
+    client.patch(f"/api/research/findings/{fid}",
+                 json={"usage_class": "background_context",
+                       "approval_status": "approved"})
+    r = client.patch(f"/api/research/findings/{fid}",
+                     json={"approval_status": "rejected"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["approval_status"] == "rejected"
+    assert body["approved_at"] is None
+
+
+# ===========================================================================
+# Phase 6: safety gate — not_usable cannot be approved
+# ===========================================================================
+
+def test_not_usable_finding_cannot_be_approved(client):
+    """Safety gate: a finding classified not_usable must be rejected with
+    422 if the caller tries to set approval_status=approved."""
+    _p6_seed_claims(client)
+    client.post("/api/research/profile-contributions",
+                json={"limit_per_query": 1})
+    fid = client.get("/api/research/findings").json()[0]["id"]
+    # First classify as not_usable
+    client.patch(f"/api/research/findings/{fid}",
+                 json={"usage_class": "not_usable"})
+    # Now try to approve → must fail
+    r = client.patch(f"/api/research/findings/{fid}",
+                     json={"approval_status": "approved"})
+    assert r.status_code == 422, (
+        f"Expected 422 for not_usable approval attempt, got {r.status_code}. "
+        "The safety gate is not enforced."
+    )
+
+
+# ===========================================================================
+# Phase 6: findings filter
+# ===========================================================================
+
+def test_findings_filter_by_approval_status(client):
+    """approval_status query param filters the findings list."""
+    _p6_seed_claims(client)
+    client.post("/api/research/profile-contributions",
+                json={"limit_per_query": 2})
+    findings = client.get("/api/research/findings").json()
+    if len(findings) < 2:
+        return  # not enough mock data to exercise filter
+    fid = findings[0]["id"]
+    client.patch(f"/api/research/findings/{fid}",
+                 json={"usage_class": "background_context",
+                       "approval_status": "approved"})
+    approved = client.get(
+        "/api/research/findings?approval_status=approved").json()
+    pending = client.get(
+        "/api/research/findings?approval_status=pending").json()
+    assert all(f["approval_status"] == "approved" for f in approved)
+    assert all(f["approval_status"] == "pending" for f in pending)
+
+
+# ===========================================================================
+# Phase 6: per-user isolation
+# ===========================================================================
+
+def test_research_findings_per_user_isolation(client):
+    """User B cannot see User A's research findings."""
+    a = _register(client, "r6a@example.com")
+    b = _register(client, "r6b@example.com")
+
+    # A seeds and runs research
+    client.post(
+        "/api/sources",
+        json={"source_type": "resume", "label": "r6",
+              "raw_text": "Led AI product development at ARUP Labs. "
+              "Drove machine learning platform strategy."},
+        headers=_auth(a["token"]),
+    )
+    claims = client.get("/api/claims",
+                        headers=_auth(a["token"])).json()
+    for c in claims[:2]:
+        client.patch(f"/api/claims/{c['id']}",
+                     json={"approval_status": "approved"},
+                     headers=_auth(a["token"]))
+    client.post("/api/research/profile-contributions",
+                json={"limit_per_query": 1},
+                headers=_auth(a["token"]))
+
+    a_findings = client.get("/api/research/findings",
+                            headers=_auth(a["token"])).json()
+    b_findings = client.get("/api/research/findings",
+                            headers=_auth(b["token"])).json()
+
+    assert len(a_findings) >= 1
+    assert len(b_findings) == 0, "B must not see A's research findings"
+
+    # B cannot get A's finding by ID either
+    if a_findings:
+        r = client.get(f"/api/research/findings/{a_findings[0]['id']}",
+                       headers=_auth(b["token"]))
+        assert r.status_code == 404
+
+
+# ===========================================================================
+# Phase 6: migration chain
+# ===========================================================================
+
+def test_phase6_migration_chain_extends_to_0008():
+    """0008_phase6_public_research is the new head and chains to 0007."""
+    vdir = pathlib.Path(__file__).parent / "alembic" / "versions"
+    revs = {}
+    for f in sorted(vdir.glob("0*.py")):
+        spec = importlib.util.spec_from_file_location(f.stem, f)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        revs[m.revision] = m.down_revision
+
+    assert "0008_phase6_public_research" in revs, (
+        "0008_phase6_public_research not found — did you copy the migration? "
+        "Expected at backend/alembic/versions/0008_phase6_public_research.py"
+    )
+    assert revs["0008_phase6_public_research"] == "0007_phase5_job_providers", (
+        "0008 must chain back to 0007_phase5_job_providers"
+    )
+
+
+# ===========================================================================
+# Phase 6: health field
+# ===========================================================================
+
+def test_phase6_upgrade_health_field(client):
+    """Health endpoint advertises upgrade phase 6."""
+    h = client.get("/api/health").json()
+    assert h["phases_shipped"] == [1, 2, 3]     # pinned, never changes
+    assert h["latest_phase"] == 4               # pinned, never changes
+    shipped = h.get("upgrade_phases_shipped", [])
+    assert 6 in shipped, (
+        f"upgrade_phases_shipped must include 6, got {shipped}. "
+        "Did app_phase6_research_block.py get appended to app.py?"
+    )

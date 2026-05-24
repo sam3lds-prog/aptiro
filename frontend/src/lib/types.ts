@@ -1,7 +1,10 @@
 // ── Enums ──────────────────────────────────────────────────────────────────
-export type SourceType = "resume" | "linkedin" | "portfolio" | "article" | "other";
+export type SourceType =
+  | "resume" | "linkedin" | "portfolio"
+  | "article" | "public_article" | "manual_note" | "other";
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "do_not_use";
-export type ProvenanceColor = "green" | "blue" | "yellow" | "red";
+// Fixed: was "green"|"blue"|"yellow"|"red" — missing purple/orange, had yellow
+export type ProvenanceColor = "blue" | "purple" | "green" | "orange" | "red";
 export type WorkMode = "remote" | "onsite" | "hybrid" | "any";
 export type Aggressiveness = "conservative" | "balanced" | "opportunistic";
 export type BulletStatus = "proposed" | "accepted" | "rejected" | "rewritten" | "locked";
@@ -11,11 +14,21 @@ export type ApplicationStatus =
   | "interviewing" | "offer" | "rejected" | "withdrawn";
 
 // ── Sources & Claims ───────────────────────────────────────────────────────
+export interface ParseMeta {
+  format?: string;
+  pages?: number;
+  page_map?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
 export interface Source {
   id: string; source_type: SourceType; label: string;
   filename?: string | null; extracted_text: string;
-  parse_meta: Record<string, unknown>; created_at: string; claim_count: number;
+  parse_meta: ParseMeta; created_at: string; claim_count: number;
 }
+// Alias kept for any older imports that haven't been updated yet
+export type SourceRow = Source;
+
 export interface SourceRef {
   id: string; source_id: string; source_type: SourceType;
   section: string; snippet: string; page?: number | null; confidence: number;
@@ -76,7 +89,6 @@ export interface Job {
   };
   is_archived: boolean; deduplicated: boolean;
   posted_at?: string | null; imported_at: string;
-  // Phase 5: provider tracking + freshness
   provider_source?: string | null; provider_job_id?: string | null;
   last_seen_at?: string | null; is_stale?: boolean;
 }
@@ -97,13 +109,11 @@ export interface Match {
   structured_requirements?: Record<string, unknown>;
   semantic?: SemanticSignal | null;
 }
-
-// Phase 5: filter type for Match Inbox
 export type MatchFilter =
   | "all" | "strong" | "moderate" | "stretch"
   | "remote" | "above_target" | "new_this_week" | "missing_req" | "stale";
 
-// ── Phase 5: Saved Searches ────────────────────────────────────────────────
+// ── Saved Searches (Phase 5) ───────────────────────────────────────────────
 export interface SavedSearch {
   id: string; owner_id: string; name: string; query: string;
   provider?: string | null; min_salary?: number | null; max_salary?: number | null;
@@ -202,3 +212,28 @@ export interface AuditEvent {
 // ── Job Sources ────────────────────────────────────────────────────────────
 export interface JobSourceInfo { id: string; mock: boolean; sample_count: number; }
 export interface JobSources { active_provider: string; available: JobSourceInfo[]; }
+
+// ── Research (Upgrade Phase 6) ─────────────────────────────────────────────
+export type ResearchUsageClass =
+  | "background_context"
+  | "claim_support"
+  | "framing_only"
+  | "not_usable";
+export type ResearchApprovalStatus = "pending" | "approved" | "rejected";
+export interface ResearchFinding {
+  id: string; owner_id: string; query: string;
+  source_url: string | null; source_title: string | null; source_snippet: string;
+  finding_text: string; usage_class: ResearchUsageClass;
+  suggested_framing: string | null; approval_status: ResearchApprovalStatus;
+  prompted_by_claim_ids: string[]; provider: string;
+  created_at: string; approved_at: string | null;
+}
+export interface ResearchQueryItem {
+  query: string; rationale: string; claim_ids: string[];
+}
+export interface GenerateQueriesOut {
+  queries: ResearchQueryItem[]; approved_claim_count: number; message: string;
+}
+export interface RunResearchOut {
+  findings_created: number; queries_used: string[]; provider: string; message: string;
+}

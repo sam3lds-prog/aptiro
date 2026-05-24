@@ -19,6 +19,8 @@ import { Auth } from "@/pages/Auth";
 import { NotFound } from "@/pages/NotFound";
 // Phase 5
 import { SavedSearches } from "@/pages/SavedSearches";
+// Phase 6
+import Research from "@/pages/Research";
 
 type Boot = "loading" | "ready" | "auth";
 
@@ -97,6 +99,8 @@ export default function App() {
         <Route path="/privacy" element={<Privacy />} />
         {/* Phase 5 */}
         <Route path="/saved-searches" element={<SavedSearches />} />
+        {/* Phase 6 */}
+        <Route path="/research" element={<Research />} />
         <Route path="/dash" element={<Navigate to="/" replace />} />
         <Route path="*" element={<NotFound />} />
       </Route>

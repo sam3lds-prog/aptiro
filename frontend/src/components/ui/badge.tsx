@@ -1,16 +1,23 @@
 import { HTMLAttributes } from "react";
 import { cn } from "@/lib/cn";
 
-type Tone = "neutral" | "blue" | "purple" | "green" | "orange" | "red" | "ink";
+// Added: muted, success, warning (used by Jobs, Matches, SavedSearches)
+type Tone =
+  | "neutral" | "blue" | "purple" | "green" | "orange" | "red" | "ink"
+  | "muted" | "success" | "warning";
 
 const TONES: Record<Tone, string> = {
   neutral: "bg-panel2 text-sub border-line",
-  blue: "bg-prov-blue/15 text-prov-blue border-prov-blue/30",
-  purple: "bg-prov-purple/15 text-prov-purple border-prov-purple/30",
-  green: "bg-prov-green/15 text-prov-green border-prov-green/30",
-  orange: "bg-prov-orange/15 text-prov-orange border-prov-orange/40",
-  red: "bg-prov-red/15 text-prov-red border-prov-red/35",
-  ink: "bg-ink/10 text-ink border-ink/20",
+  blue:    "bg-prov-blue/15 text-prov-blue border-prov-blue/30",
+  purple:  "bg-prov-purple/15 text-prov-purple border-prov-purple/30",
+  green:   "bg-prov-green/15 text-prov-green border-prov-green/30",
+  orange:  "bg-prov-orange/15 text-prov-orange border-prov-orange/40",
+  red:     "bg-prov-red/15 text-prov-red border-prov-red/35",
+  ink:     "bg-ink/10 text-ink border-ink/20",
+  // semantic aliases
+  muted:   "bg-panel2/80 text-sub/50 border-line/40",
+  success: "bg-prov-green/15 text-prov-green border-prov-green/30",
+  warning: "bg-prov-orange/15 text-prov-orange border-prov-orange/40",
 };
 
 interface BadgeProps extends HTMLAttributes<HTMLSpanElement> {

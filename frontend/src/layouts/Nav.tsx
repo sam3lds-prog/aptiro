@@ -15,6 +15,7 @@ const NAV: { to: string; label: string; section?: string }[] = [
   { to: "/tracker",        label: "Tracker" },
   { to: "/apply",          label: "Apply" },
   // Other
+  { to: "/research",       label: "Research",       section: "Other" },
   { to: "/activity",       label: "Activity",       section: "Other" },
   { to: "/privacy",        label: "Privacy" },
 ];

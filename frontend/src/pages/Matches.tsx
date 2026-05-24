@@ -312,7 +312,7 @@ function MatchCard({
 
             {/* Must-have requirements if available */}
             {match.structured_requirements &&
-              (match.structured_requirements as Record<string, unknown>).must_have &&
+              Boolean((match.structured_requirements as Record<string, unknown>).must_have) &&
               ((match.structured_requirements as Record<string, unknown[]>).must_have as string[]).length > 0 && (
                 <div className="mt-3">
                   <div className="text-[12px] font-medium mb-1.5">

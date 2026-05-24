@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "@/lib/api";
-import type { Claim, SourceRow, SourceType } from "@/lib/types";
+import type { Claim, Source, SourceType } from "@/lib/types";
 import { PageHeader } from "@/components/PageHeader";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -24,9 +24,9 @@ const SOURCE_TYPES: { id: SourceType; label: string }[] = [
 export function Vault() {
   const qc = useQueryClient();
   const notify = useNotify();
-  const sourcesQ = useQuery<SourceRow[]>({
+  const sourcesQ = useQuery<Source[]>({
     queryKey: ["sources"],
-    queryFn: () => api<SourceRow[]>("/sources"),
+    queryFn: () => api<Source[]>("/sources"),
   });
   const claimsQ = useQuery<Claim[]>({
     queryKey: ["claims"],
@@ -38,7 +38,7 @@ export function Vault() {
   const [sel, setSel] = useState<string>("all");
   const [edit, setEdit] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const [delTarget, setDelTarget] = useState<SourceRow | null>(null);
+  const [delTarget, setDelTarget] = useState<Source | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const refreshAll = () => {
@@ -110,7 +110,7 @@ export function Vault() {
     }
   }
 
-  async function deleteSource(s: SourceRow) {
+  async function deleteSource(s: Source) {
     await api(`/sources/${s.id}`, { method: "DELETE" });
     notify.success("Source deleted (claims + evidence cascaded).");
     refreshAll();
@@ -353,6 +353,5 @@ export function Vault() {
 function statusTone(s: Claim["approval_status"]): "neutral" | "green" | "red" | "orange" {
   if (s === "approved") return "green";
   if (s === "rejected" || s === "do_not_use") return "red";
-  if (s === "edited") return "orange";
-  return "neutral";
+return "neutral";
 }
