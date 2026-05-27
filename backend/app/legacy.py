@@ -103,37 +103,21 @@ def _uid():
     return _CURRENT_UID.get()
 
 
-# --- Phase 6: ops & observability ----------------------------------------
-import json as _json
-import logging as _logging
-import time as _time
-import uuid as _uuidmod
+# --- Phase 6: ops & observability (Phase 9 PR-2: moved to core/observability.py)
+import json as _json         # kept — may be used elsewhere in legacy
+import logging as _logging    # kept — may be used elsewhere in legacy
+import time as _time          # KEPT — auth middleware: _time.perf_counter()
+import uuid as _uuidmod       # KEPT — auth middleware: _uuidmod.uuid4().hex[:16]
 
-_REQUEST_ID = ContextVar("aptiro_rid", default="-")
-
-
-def _rid():
-    return _REQUEST_ID.get()
-
-
-_log = _logging.getLogger("aptiro")
-if not _log.handlers:
-    _h = _logging.StreamHandler(_sys.stdout)
-    _h.setFormatter(_logging.Formatter("%(message)s"))
-    _log.addHandler(_h)
-    _log.setLevel(os.getenv("APTIRO_LOG_LEVEL", "INFO").upper())
-    _log.propagate = False
-
-
-def _logj(event, **fields):
-    """One structured JSON line per event. Never raises."""
-    try:
-        rec = {"ts": _now().isoformat(), "event": event,
-               "request_id": _rid()}
-        rec.update(fields)
-        _log.info(_json.dumps(rec, default=str))
-    except Exception:
-        pass
+# APTIRO_PHASE9_PR2_OBS_MARKER
+# Definitions live in backend/app/core/observability.py.
+# Imported here so the module proxy + `import app as A; A.X` contract holds.
+from app.core.observability import (  # noqa: F401
+    _REQUEST_ID,   # ContextVar[str] — per-request correlation ID
+    _rid,          # () -> str — current request ID
+    _log,          # logging.Logger — the "aptiro" logger singleton
+    _logj,         # (event, **fields) -> None — structured JSON log line
+)
 
 
 class ConfigError(RuntimeError):
