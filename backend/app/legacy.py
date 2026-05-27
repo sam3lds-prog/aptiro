@@ -53,47 +53,14 @@ try:
 except Exception:  # pragma: no cover - httpx ships with the test client
     _httpx = None
 
-_DEFAULT_DATABASE_URL = "sqlite:///./aptiro.db"
-
-# Every Aptiro setting is read from an APTIRO_-prefixed environment
-# variable so it never collides with generic vars other apps may use.
-
-
-def _resolve_database_url():
-    url = os.getenv("APTIRO_DATABASE_URL") or _DEFAULT_DATABASE_URL
-    if url.startswith("sqlite"):
-        return url
-    if url.startswith(("postgresql", "postgres")):
-        if not (_ilu.find_spec("psycopg2") or _ilu.find_spec("psycopg")):
-            print(
-                f"[aptiro] APTIRO_DATABASE_URL={url!r} needs a Postgres "
-                f"driver that is not installed; falling back to "
-                f"{_DEFAULT_DATABASE_URL}. `pip install psycopg2-binary` "
-                f"for Postgres.",
-                file=_sys.stderr,
-            )
-            return _DEFAULT_DATABASE_URL
-    return url
-
-
-DATABASE_URL = _resolve_database_url()
-AI_PROVIDER = os.getenv("APTIRO_AI_PROVIDER", "mock")
-EMBEDDING_PROVIDER = os.getenv("APTIRO_EMBEDDING_PROVIDER", "mock")
-JOB_PROVIDER = os.getenv("APTIRO_JOB_PROVIDER", "mock")
-SEARCH_PROVIDER = os.getenv("APTIRO_SEARCH_PROVIDER", "mock")
-NOTIFICATION_PROVIDER = os.getenv("APTIRO_NOTIFICATION_PROVIDER", "mock")
-SEED_ON_STARTUP = os.getenv("APTIRO_SEED_ON_STARTUP", "1") == "1"
-
-# --- Phase 4: multi-user & auth ------------------------------------------
-# AUTH defaults to OFF. With AUTH off, every request runs as the single
-# built-in "local" user, so the entire prior test suite and existing
-# single-user data behave EXACTLY as before. Turn it on to require a
-# bearer token for mutating requests and isolate data per user.
-AUTH_ENABLED = os.getenv("APTIRO_AUTH", "off").lower() in ("on", "1",
-                                                           "true")
-DEFAULT_UID = "local"
-DEFAULT_USER_EMAIL = "local@aptiro.local"
-_PW_ROUNDS = 120_000
+# APTIRO_PHASE9_PR3_CONFIG_MARKER
+# Config vars, auth constants: extracted to core/config.py (Phase 9 PR-3)
+from app.core.config import (  # noqa: F401
+    _DEFAULT_DATABASE_URL, DATABASE_URL,
+    AI_PROVIDER, EMBEDDING_PROVIDER, JOB_PROVIDER,
+    SEARCH_PROVIDER, NOTIFICATION_PROVIDER, SEED_ON_STARTUP,
+    AUTH_ENABLED, DEFAULT_UID, DEFAULT_USER_EMAIL, _PW_ROUNDS,
+)
 # Per-request current user id. Defaults to the local user so code paths
 # with no auth context (tests, single-user mode) just work.
 _CURRENT_UID = ContextVar("aptiro_uid", default=DEFAULT_UID)
@@ -120,48 +87,12 @@ from app.core.observability import (  # noqa: F401
 )
 
 
-class ConfigError(RuntimeError):
-    pass
+# ConfigError, validate_config, URL limits: extracted to core/config.py (Phase 9 PR-3)
+from app.core.config import (  # noqa: F401
+    ConfigError, validate_config,
+    URL_FETCH_TIMEOUT, URL_FETCH_MAX_BYTES,
+)
 
-
-def validate_config():
-    """Fail fast on genuinely invalid configuration with a clear
-    message. Defaults are always valid, so normal startup and the test
-    suite are unaffected; only explicitly bad env trips this."""
-    problems = []
-    if not (DATABASE_URL or "").strip():
-        problems.append("APTIRO_DATABASE_URL is empty")
-    a = os.getenv("APTIRO_AUTH", "off").lower()
-    if a not in ("on", "off", "1", "0", "true", "false"):
-        problems.append("APTIRO_AUTH must be on/off (got %r)" % a)
-    for name, raw in (
-            ("APTIRO_URL_FETCH_TIMEOUT",
-             os.getenv("APTIRO_URL_FETCH_TIMEOUT")),
-            ("APTIRO_URL_FETCH_MAX_BYTES",
-             os.getenv("APTIRO_URL_FETCH_MAX_BYTES")),
-            ("APTIRO_AI_MAX_TOKENS", os.getenv("APTIRO_AI_MAX_TOKENS")),
-            ("APTIRO_AI_TIMEOUT", os.getenv("APTIRO_AI_TIMEOUT"))):
-        if raw is None:
-            continue
-        try:
-            if float(raw) <= 0:
-                problems.append("%s must be > 0 (got %r)" % (name, raw))
-        except (TypeError, ValueError):
-            problems.append("%s must be numeric (got %r)" % (name, raw))
-    if os.getenv("APTIRO_AI_PROVIDER", "mock").lower() == "anthropic" \
-            and not os.getenv("ANTHROPIC_API_KEY"):
-        # not fatal: provider falls back to mock, but make it loud
-        _logj("config.warning",
-              message="APTIRO_AI_PROVIDER=anthropic but ANTHROPIC_API_"
-                      "KEY is unset; falling back to the mock provider")
-    if problems:
-        raise ConfigError("Invalid configuration: " + "; ".join(problems))
-    return True
-# URL import guardrails (server-side fetch of a user-supplied public URL
-# only - never a crawler). All overridable via APTIRO_-prefixed env.
-URL_FETCH_TIMEOUT = float(os.getenv("APTIRO_URL_FETCH_TIMEOUT", "10"))
-URL_FETCH_MAX_BYTES = int(
-    os.getenv("APTIRO_URL_FETCH_MAX_BYTES", str(2 * 1024 * 1024)))
 # Hosts we will not fetch: login/auth-walled or scrape-prohibited.
 _URL_FETCH_DENY = {
     "linkedin.com", "www.linkedin.com", "indeed.com", "www.indeed.com",
