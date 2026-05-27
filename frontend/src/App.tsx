@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Routes, Route, Navigate } from "react-router-dom";
+import { Routes, Route } from "react-router-dom";
 import { api } from "@/lib/api";
 import { useAuth } from "@/stores/auth";
 import { useNotify } from "@/stores/toast";
@@ -17,17 +17,28 @@ import { Activity } from "@/pages/Activity";
 import { Privacy } from "@/pages/Privacy";
 import { Auth } from "@/pages/Auth";
 import { NotFound } from "@/pages/NotFound";
-// Phase 5
+// Upgrade Phase 5
 import { SavedSearches } from "@/pages/SavedSearches";
-// Phase 6
+// Upgrade Phase 6
 import Research from "@/pages/Research";
+// Upgrade Phase 7
+import { Notifications } from "@/pages/Notifications";
 
 type Boot = "loading" | "ready" | "auth";
 
 export default function App() {
   const [boot, setBoot] = useState<Boot>("loading");
-  const { setAuth, setMe } = useAuth();
+  const { setMe } = useAuth();
+  // When Auth page calls setMe() on success, this re-renders and we
+  // transition to "ready" via the effect below.
+  const me = useAuth((s) => s.me);
   const notify = useNotify();
+
+  useEffect(() => {
+    if (boot === "auth" && me && !me.is_default) {
+      setBoot("ready");
+    }
+  }, [me, boot]);
 
   useEffect(() => {
     let cancelled = false;
@@ -39,6 +50,7 @@ export default function App() {
           if (!cancelled) setBoot("ready");
           return;
         }
+        // Auth is on — check if an existing token is valid.
         try {
           const m = await api<Me>("/auth/me");
           if (cancelled) return;
@@ -61,47 +73,39 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   if (boot === "loading") {
     return (
-      <div className="min-h-screen flex items-center justify-center text-sub text-sm">
-        Loading…
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="font-display text-2xl font-bold tracking-tight opacity-60 animate-pulse">
+          Aptiro
+        </div>
       </div>
     );
   }
 
   if (boot === "auth") {
-    return (
-      <Auth
-        onAuthed={(token, me) => {
-          setAuth(token, me);
-          setBoot("ready");
-        }}
-      />
-    );
+    return <Auth onAuthed={(token, m) => { setMe(m); }} />;
   }
 
   return (
     <Routes>
       <Route element={<AppLayout />}>
-        <Route index element={<Dashboard />} />
+        <Route path="/" element={<Dashboard />} />
         <Route path="/vault" element={<Vault />} />
         <Route path="/strategy" element={<Strategy />} />
         <Route path="/jobs" element={<Jobs />} />
         <Route path="/matches" element={<Matches />} />
+        <Route path="/saved-searches" element={<SavedSearches />} />
         <Route path="/packages" element={<Packages />} />
-        <Route path="/packages/:packageId" element={<Packages />} />
         <Route path="/tracker" element={<Tracker />} />
         <Route path="/apply" element={<Apply />} />
+        <Route path="/research" element={<Research />} />
+        {/* Upgrade Phase 7 */}
+        <Route path="/notifications" element={<Notifications />} />
         <Route path="/activity" element={<Activity />} />
         <Route path="/privacy" element={<Privacy />} />
-        {/* Phase 5 */}
-        <Route path="/saved-searches" element={<SavedSearches />} />
-        {/* Phase 6 */}
-        <Route path="/research" element={<Research />} />
-        <Route path="/dash" element={<Navigate to="/" replace />} />
         <Route path="*" element={<NotFound />} />
       </Route>
     </Routes>

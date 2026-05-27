@@ -1,3 +1,134 @@
+# CHANGES — Upgrade Phase 7: Real Notification Center
+
+Phase 7 is **additive and behavior-preserving**. Every existing
+invariant from Phases 1–6 is untouched: all prior tests stay green and
+the suite grows **164 → 180** (16 new tests, 0 removed, 0 modified).
+No new Python dependencies (email uses stdlib `smtplib`/`email`). The
+zero-config default — nothing sent externally until the operator
+explicitly provides credentials — is fully preserved.
+
+## Added
+
+### Backend (`app.py`)
+
+- **`UserNotificationPreference` table** — per-user opt-in settings for
+  every channel. Defaults: `in_app_enabled=True`, everything else off
+  and empty. The one-row-per-owner design enforces that defaults are
+  always safe. Owner-isolated: `GET/PUT /api/notifications/preferences`.
+
+- **`InAppNotification` table** — real in-app notification center items
+  with `is_read` state. Persisted indefinitely; user-deletable. Powers
+  the frontend inbox. Not in the privacy export/wipe bundle (ephemeral
+  UI state, not personal data).
+
+- **`GET /api/notifications/inbox`** — list all in-app notifications
+  for the current user (newest first) with `unread_count`.
+
+- **`POST /api/notifications/inbox/{id}/read`** — mark one notification
+  read.
+
+- **`POST /api/notifications/inbox/read-all`** — mark all read.
+
+- **`DELETE /api/notifications/inbox/{id}`** — delete a notification.
+
+- **`POST /api/notifications/send/digest`** — render and deliver a
+  daily digest to all configured channels (in-app always; email when
+  SMTP configured and user opted in; SMS when Twilio configured and
+  user explicitly opted in).
+
+- **`POST /api/notifications/send/match-alert`** — score all active
+  jobs and fire an alert for each one at or above the user's
+  `match_alert_threshold`. No-op when threshold is 0 (default).
+
+- **`_send_email_raw()`** — stdlib `smtplib` sender; supports
+  STARTTLS (default), plain TLS (`APTIRO_SMTP_TLS=ssl`), and no-TLS.
+  Silent no-op when `APTIRO_SMTP_HOST` is unset.
+
+- **`_send_sms_raw()`** — Twilio REST via `httpx` (already a dep).
+  Silent no-op when `APTIRO_TWILIO_SID/TOKEN/FROM` are unset.
+
+- **`_deliver_notification()`** — unified delivery helper: writes
+  in-app row, calls email + SMS senders, writes legacy
+  `NotificationPreview` row for backward compat. Never raises.
+
+- **`_smtp_configured()` / `_twilio_configured()`** — boolean guards
+  exposed in the preferences response so the frontend can show accurate
+  status banners.
+
+- **New config env vars** (all optional; defaults are always valid):
+  `APTIRO_SMTP_HOST`, `APTIRO_SMTP_PORT` (default 587),
+  `APTIRO_SMTP_USER`, `APTIRO_SMTP_PASS`, `APTIRO_SMTP_FROM`,
+  `APTIRO_SMTP_TLS` (`starttls`|`ssl`|`none`),
+  `APTIRO_TWILIO_SID`, `APTIRO_TWILIO_TOKEN`, `APTIRO_TWILIO_FROM`.
+
+- **`upgrade_phases_shipped`** health field updated to include `7`.
+
+### Backend — migration
+
+- **`0009_phase7_notifications`** — creates `usernotificationpreference`
+  and `inappnotification` tables for Postgres deployments. Chains
+  correctly from `0008_phase6_public_research`. Reversible.
+
+### Frontend
+
+- **New `Notifications` page** (`/notifications`) — two-tab layout:
+  - **Inbox tab**: real-time in-app notification list with unread
+    badge, "Mark read", "Mark all read", "Delete", and "Send digest
+    now" actions. Polls every 30 s; empty state with CTA.
+  - **Preferences tab**: structured settings for in-app, email
+    (toggles for daily/weekly digest, match alerts, follow-up
+    reminders, email address field), match-alert threshold slider
+    (0–100), and SMS (explicit opt-in with E.164 phone field).
+    Status banners explain when SMTP/Twilio are not configured.
+
+- **Updated `Nav.tsx`** — Notifications link added under the "Other"
+  section. Displays an unread-count badge (polled every 60 s) that
+  vanishes when the inbox is empty.
+
+- **Updated `App.tsx`** — imports and routes the `Notifications` page.
+
+- **Updated `types.ts`** — adds `InAppNotification`, `NotifInboxOut`,
+  `NotificationPreference`, `SendDigestOut`, `SendAlertOut`, and
+  extends `NotificationKind` with `weekly_digest`,
+  `match_threshold_alert`, `followup_reminder`.
+
+## Explicitly NOT changed
+
+- All 164 existing tests: untouched and green.
+- The existing `/api/notifications/channels` response contract:
+  `sends_externally` remains `false` in any environment where
+  `APTIRO_SMTP_HOST` is unset (which includes all tests).
+- The `NotificationPreview` / legacy notification history flow:
+  `_deliver_notification` continues to write a legacy preview row
+  so existing `/api/notifications` history queries still work.
+- No auto-submit, no scraping, no CAPTCHA bypass, no fabricated claims.
+- Mock provider remains the default; the app and full suite run
+  offline with no keys.
+
+## Validation
+
+```
+1.  cd backend && pytest -q          → 180 passed (offline, no key)
+2.  cd frontend && npm run typecheck → clean
+3.  cd frontend && npm run build     → clean
+4.  ./RUN.sh                         → boots; Notifications page visible at /notifications
+```
+
+## Deployment notes
+
+- Zero-config local: `./RUN.sh` — nothing is sent because SMTP/Twilio
+  are unset. In-app inbox works immediately.
+- To enable email: add `APTIRO_SMTP_HOST`, `APTIRO_SMTP_USER`,
+  `APTIRO_SMTP_PASS` to `.env` (or the environment), then opt in via
+  the Notifications → Preferences page.
+- To enable SMS: add `APTIRO_TWILIO_SID`, `APTIRO_TWILIO_TOKEN`,
+  `APTIRO_TWILIO_FROM`; user must also toggle SMS on and supply a
+  phone number — there is no implicit opt-in.
+- Postgres: run `alembic upgrade head` to create the two new tables.
+  SQLite: tables are auto-created on next boot (no action needed).
+
+---
+
 # CHANGES — Upgrade Phase 4: Strategy Builder (multi-strategy + live preview)
 
 Phase 4 is **additive and behavior-preserving**. Every existing

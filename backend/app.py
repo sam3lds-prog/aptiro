@@ -1813,7 +1813,7 @@ def health():
     return {"status": "ok", "app": "Aptiro", "delivery": 4,
             "slice": "trust-export", "phase": 2,
             "phases_shipped": [1, 2, 3], "latest_phase": 4,
-            "upgrade_phases_shipped": [7, 4, 5, 6],
+            "upgrade_phases_shipped": [7, 4, 5, 6, 7],
             "providers": {"ai": AI_PROVIDER, "job": JOB_PROVIDER,
                           "search": SEARCH_PROVIDER,
                           "notification": NOTIFICATION_PROVIDER,
@@ -6329,3 +6329,437 @@ except NameError:
 
 if 6 not in _UPGRADE_PHASES_SHIPPED:
     _UPGRADE_PHASES_SHIPPED = list(_UPGRADE_PHASES_SHIPPED) + [6]
+
+
+# ===========================================================================
+# Upgrade Phase 7 — Real notification center
+# In-app inbox + email via stdlib smtplib (zero new deps) + SMS/Twilio
+# behind explicit opt-in. Default: nothing sent until configured.
+# APTIRO_PHASE7_NOTIFICATIONS_MARKER — do not remove; idempotency guard.
+# ===========================================================================
+import smtplib as _smtplib
+from email.mime.multipart import MIMEMultipart as _MIMEMultipart
+from email.mime.text import MIMEText as _MIMEText
+
+# --- Phase 7 config env vars -------------------------------------------
+_SMTP_HOST = os.getenv("APTIRO_SMTP_HOST", "")
+try:
+    _SMTP_PORT = int(os.getenv("APTIRO_SMTP_PORT", "587") or "587")
+except ValueError:
+    _SMTP_PORT = 587
+_SMTP_USER = os.getenv("APTIRO_SMTP_USER", "")
+_SMTP_PASS = os.getenv("APTIRO_SMTP_PASS", "")
+_SMTP_FROM = os.getenv("APTIRO_SMTP_FROM", "") or _SMTP_USER
+_SMTP_TLS = os.getenv("APTIRO_SMTP_TLS", "starttls").lower()
+_TWILIO_SID = os.getenv("APTIRO_TWILIO_SID", "")
+_TWILIO_TOKEN = os.getenv("APTIRO_TWILIO_TOKEN", "")
+_TWILIO_FROM = os.getenv("APTIRO_TWILIO_FROM", "")
+
+
+def _smtp_configured() -> bool:
+    return bool(_SMTP_HOST and _SMTP_USER and _SMTP_PASS)
+
+
+def _twilio_configured() -> bool:
+    return bool(_TWILIO_SID and _TWILIO_TOKEN and _TWILIO_FROM)
+
+
+# --- Phase 7 SQLModel tables -------------------------------------------
+
+class UserNotificationPreference(SQLModel, table=True):
+    """Per-user notification opt-in settings. Default: nothing is sent
+    until the user explicitly enables a channel and supplies an address.
+    In-app notifications are always persisted (zero external cost)."""
+    __tablename__ = "usernotificationpreference"
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    owner_id: str = Field(index=True, unique=True)
+    # In-app center (always on)
+    in_app_enabled: bool = True
+    # Email — off by default; requires address + SMTP server config
+    email_enabled: bool = False
+    email_address: str = ""
+    email_daily_digest: bool = False
+    email_weekly_digest: bool = False
+    email_match_alerts: bool = False
+    email_followup_reminders: bool = False
+    # Score threshold for match alerts: 0 = disabled
+    match_alert_threshold: int = Field(default=0)
+    # SMS — off by default, explicit opt-in only, requires Twilio config
+    sms_enabled: bool = False
+    sms_phone: str = ""
+    created_at: datetime = Field(default_factory=_now)
+    updated_at: datetime = Field(default_factory=_now)
+
+
+class InAppNotification(SQLModel, table=True):
+    """Real in-app notification center items. Persisted per owner with
+    read/unread state. Cleared on delete; not in the privacy bundle."""
+    __tablename__ = "inappnotification"
+    id: str = Field(default_factory=_uuid, primary_key=True)
+    owner_id: str = Field(index=True)
+    kind: str = ""
+    subject: str = ""
+    body: str = ""
+    package_id: Optional[str] = None
+    is_read: bool = False
+    created_at: datetime = Field(default_factory=_now)
+
+
+# --- Phase 7 helpers ---------------------------------------------------
+
+def _get_or_create_prefs(session, owner_id: str) -> UserNotificationPreference:
+    """Fetch the owner's preference row, creating a safe default if absent."""
+    prefs = session.exec(
+        select(UserNotificationPreference).where(
+            UserNotificationPreference.owner_id == owner_id
+        )
+    ).first()
+    if not prefs:
+        prefs = UserNotificationPreference(owner_id=owner_id)
+        session.add(prefs)
+        session.commit()
+        session.refresh(prefs)
+    return prefs
+
+
+def _send_email_raw(to_addr: str, subject: str, body: str) -> bool:
+    """Send a plain-text email via the configured SMTP server.
+    Returns True on success, False on any error. Never raises.
+    No-ops silently when SMTP is not configured."""
+    if not _smtp_configured() or not to_addr:
+        return False
+    try:
+        msg = _MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = _SMTP_FROM
+        msg["To"] = to_addr
+        msg.attach(_MIMEText(body, "plain"))
+        if _SMTP_TLS == "ssl":
+            import ssl as _ssl
+            ctx = _ssl.create_default_context()
+            with _smtplib.SMTP_SSL(_SMTP_HOST, _SMTP_PORT, context=ctx) as srv:
+                srv.login(_SMTP_USER, _SMTP_PASS)
+                srv.sendmail(_SMTP_FROM, to_addr, msg.as_string())
+        else:
+            with _smtplib.SMTP(_SMTP_HOST, _SMTP_PORT) as srv:
+                srv.ehlo()
+                if _SMTP_TLS == "starttls":
+                    srv.starttls()
+                    srv.ehlo()
+                if _SMTP_USER:
+                    srv.login(_SMTP_USER, _SMTP_PASS)
+                srv.sendmail(_SMTP_FROM, to_addr, msg.as_string())
+        _logj("email_sent", to=to_addr, subject=subject)
+        return True
+    except Exception as exc:
+        _logj("email_error", to=to_addr, error=str(exc))
+        return False
+
+
+def _send_sms_raw(to_phone: str, body: str) -> bool:
+    """Send an SMS via Twilio REST. Uses httpx (already a dep).
+    Returns True on success, False on any error. Never raises.
+    No-ops when Twilio credentials are absent or httpx is unavailable."""
+    if not _twilio_configured() or not to_phone or _httpx is None:
+        return False
+    try:
+        url = ("https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json"
+               % _TWILIO_SID)
+        resp = _httpx.post(
+            url,
+            auth=(_TWILIO_SID, _TWILIO_TOKEN),
+            data={"From": _TWILIO_FROM, "To": to_phone,
+                  "Body": body[:1600]},
+            timeout=10,
+        )
+        ok = resp.status_code in (200, 201)
+        _logj("sms_sent" if ok else "sms_error",
+              to=to_phone, status=resp.status_code)
+        return ok
+    except Exception as exc:
+        _logj("sms_error", to=to_phone, error=str(exc))
+        return False
+
+
+def _deliver_notification(
+    session,
+    kind: str,
+    subject: str,
+    body: str,
+    package_id: Optional[str] = None,
+    owner_id: Optional[str] = None,
+) -> dict:
+    """Deliver a notification through all configured channels for the owner.
+
+    * Always writes an InAppNotification row when in_app_enabled (default).
+    * Sends email only when email_enabled + address present + SMTP configured.
+    * Sends SMS only when sms_enabled + phone present + Twilio configured.
+    * Also writes a legacy NotificationPreview row for backwards compat.
+
+    Returns a summary dict {in_app_id, email_sent, sms_sent}."""
+    oid = owner_id or _uid()
+    prefs = _get_or_create_prefs(session, oid)
+
+    # 1. In-app
+    in_app_id: Optional[str] = None
+    if prefs.in_app_enabled:
+        n = InAppNotification(
+            owner_id=oid,
+            kind=kind,
+            subject=subject,
+            body=body,
+            package_id=package_id,
+        )
+        session.add(n)
+        session.commit()
+        session.refresh(n)
+        in_app_id = n.id
+
+    # 2. Email
+    email_sent = False
+    if prefs.email_enabled and prefs.email_address and _smtp_configured():
+        email_sent = _send_email_raw(prefs.email_address, subject, body)
+
+    # 3. SMS (explicit opt-in only)
+    sms_sent = False
+    if prefs.sms_enabled and prefs.sms_phone and _twilio_configured():
+        sms_sent = _send_sms_raw(prefs.sms_phone, body)
+
+    # 4. Legacy preview row (keeps existing /notifications history working)
+    try:
+        _persist_previews(
+            session,
+            NotificationKind.daily_digest,
+            (subject, body),
+            package_id=package_id,
+            only=NotificationChannel.in_app,
+        )
+    except Exception:
+        pass
+
+    return {"in_app_id": in_app_id, "email_sent": email_sent,
+            "sms_sent": sms_sent}
+
+
+# --- Phase 7 Pydantic I/O models ---------------------------------------
+
+class NotifPrefUpdate(BaseModel):
+    in_app_enabled: Optional[bool] = None
+    email_enabled: Optional[bool] = None
+    email_address: Optional[str] = None
+    email_daily_digest: Optional[bool] = None
+    email_weekly_digest: Optional[bool] = None
+    email_match_alerts: Optional[bool] = None
+    email_followup_reminders: Optional[bool] = None
+    match_alert_threshold: Optional[int] = None
+    sms_enabled: Optional[bool] = None
+    sms_phone: Optional[str] = None
+
+
+class NotifPrefOut(BaseModel):
+    id: str
+    owner_id: str
+    in_app_enabled: bool
+    email_enabled: bool
+    email_address: str
+    email_daily_digest: bool
+    email_weekly_digest: bool
+    email_match_alerts: bool
+    email_followup_reminders: bool
+    match_alert_threshold: int
+    sms_enabled: bool
+    sms_phone: str
+    smtp_configured: bool
+    twilio_configured: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class InAppNotifOut(BaseModel):
+    id: str
+    owner_id: str
+    kind: str
+    subject: str
+    body: str
+    package_id: Optional[str]
+    is_read: bool
+    created_at: datetime
+
+
+class NotifInboxOut(BaseModel):
+    items: List[InAppNotifOut]
+    unread_count: int
+
+
+class SendDigestOut(BaseModel):
+    subject: str
+    in_app_id: Optional[str]
+    email_sent: bool
+    sms_sent: bool
+    top_job_count: int
+
+
+class SendAlertOut(BaseModel):
+    alerts_generated: int
+    above_threshold: int
+    threshold: int
+
+
+def _pref_out(p: UserNotificationPreference) -> NotifPrefOut:
+    return NotifPrefOut(
+        id=p.id, owner_id=p.owner_id,
+        in_app_enabled=p.in_app_enabled,
+        email_enabled=p.email_enabled, email_address=p.email_address,
+        email_daily_digest=p.email_daily_digest,
+        email_weekly_digest=p.email_weekly_digest,
+        email_match_alerts=p.email_match_alerts,
+        email_followup_reminders=p.email_followup_reminders,
+        match_alert_threshold=p.match_alert_threshold,
+        sms_enabled=p.sms_enabled, sms_phone=p.sms_phone,
+        smtp_configured=_smtp_configured(),
+        twilio_configured=_twilio_configured(),
+        created_at=p.created_at, updated_at=p.updated_at,
+    )
+
+
+def _inapp_out(n: InAppNotification) -> InAppNotifOut:
+    return InAppNotifOut(
+        id=n.id, owner_id=n.owner_id, kind=n.kind,
+        subject=n.subject, body=n.body, package_id=n.package_id,
+        is_read=n.is_read, created_at=n.created_at,
+    )
+
+
+# --- Phase 7 routers ---------------------------------------------------
+
+notif_prefs_router = APIRouter(prefix="/api/notifications",
+                               tags=["notifications"])
+notif_inbox_router = APIRouter(prefix="/api/notifications/inbox",
+                               tags=["notifications"])
+notif_send_router = APIRouter(prefix="/api/notifications/send",
+                              tags=["notifications"])
+
+
+@notif_prefs_router.get("/preferences", response_model=NotifPrefOut)
+def get_notif_prefs(session: Session = Depends(get_session)):
+    return _pref_out(_get_or_create_prefs(session, _uid()))
+
+
+@notif_prefs_router.put("/preferences", response_model=NotifPrefOut)
+def update_notif_prefs(body: NotifPrefUpdate,
+                       session: Session = Depends(get_session)):
+    prefs = _get_or_create_prefs(session, _uid())
+    for field, val in body.model_dump(exclude_none=True).items():
+        if field == "match_alert_threshold":
+            val = max(0, min(100, int(val)))
+        setattr(prefs, field, val)
+    prefs.updated_at = _now()
+    session.add(prefs)
+    session.commit()
+    session.refresh(prefs)
+    return _pref_out(prefs)
+
+
+@notif_inbox_router.get("", response_model=NotifInboxOut)
+def get_inbox(session: Session = Depends(get_session)):
+    items = session.exec(
+        select(InAppNotification)
+        .where(InAppNotification.owner_id == _uid())
+        .order_by(InAppNotification.created_at.desc())
+    ).all()
+    unread = sum(1 for n in items if not n.is_read)
+    return NotifInboxOut(items=[_inapp_out(n) for n in items],
+                         unread_count=unread)
+
+
+@notif_inbox_router.post("/read-all", response_model=NotifInboxOut)
+def mark_all_read(session: Session = Depends(get_session)):
+    items = session.exec(
+        select(InAppNotification)
+        .where(InAppNotification.owner_id == _uid())
+        .where(InAppNotification.is_read == False)  # noqa: E712
+    ).all()
+    for n in items:
+        n.is_read = True
+        session.add(n)
+    session.commit()
+    return get_inbox(session=session)
+
+
+@notif_inbox_router.post("/{notif_id}/read", response_model=InAppNotifOut)
+def mark_read(notif_id: str, session: Session = Depends(get_session)):
+    n = session.get(InAppNotification, notif_id)
+    if not n or n.owner_id != _uid():
+        raise HTTPException(404, "Notification not found")
+    n.is_read = True
+    session.add(n)
+    session.commit()
+    session.refresh(n)
+    return _inapp_out(n)
+
+
+@notif_inbox_router.delete("/{notif_id}", status_code=204)
+def delete_notif(notif_id: str,
+                 session: Session = Depends(get_session)):
+    n = session.get(InAppNotification, notif_id)
+    if not n or n.owner_id != _uid():
+        raise HTTPException(404, "Notification not found")
+    session.delete(n)
+    session.commit()
+    return Response(status_code=204)
+
+
+@notif_send_router.post("/digest", response_model=SendDigestOut)
+def send_digest(session: Session = Depends(get_session)):
+    """Render and deliver a daily digest for the current user.
+    Writes to in-app inbox always; sends email/SMS when configured."""
+    subject, body = _render_digest(session)
+    result = _deliver_notification(session, "daily_digest", subject, body)
+    jobs = session.exec(select(JobPosting).where(
+        JobPosting.is_archived == False)).all()  # noqa: E712
+    return SendDigestOut(
+        subject=subject,
+        in_app_id=result["in_app_id"],
+        email_sent=result["email_sent"],
+        sms_sent=result["sms_sent"],
+        top_job_count=min(3, len(jobs)),
+    )
+
+
+@notif_send_router.post("/match-alert", response_model=SendAlertOut)
+def send_match_alert(session: Session = Depends(get_session)):
+    """Check active jobs against the user's match-alert threshold and
+    deliver an in-app (+ email/SMS) alert for each job above it.
+    No-op when threshold is 0 (the default)."""
+    prefs = _get_or_create_prefs(session, _uid())
+    threshold = prefs.match_alert_threshold
+    if threshold == 0:
+        return SendAlertOut(alerts_generated=0, above_threshold=0,
+                            threshold=0)
+
+    jobs = session.exec(select(JobPosting).where(
+        JobPosting.is_archived == False)).all()  # noqa: E712
+    strat = _active_strategy(session)
+    alerts = above = 0
+    for j in jobs:
+        sc = score_job(session, j, strat)["score"]
+        if sc >= threshold:
+            above += 1
+            subj = ("High-fit match: %s @ %s (%d/100)"
+                    % (j.title, j.company, sc))
+            bd = (
+                "%s at %s scored %d/100 against your active strategy, "
+                "meeting your alert threshold of %d. "
+                "Review it in Match Inbox." % (j.title, j.company, sc, threshold)
+            )
+            _deliver_notification(session, "match_threshold_alert",
+                                   subj, bd)
+            alerts += 1
+
+    return SendAlertOut(alerts_generated=alerts, above_threshold=above,
+                        threshold=threshold)
+
+
+app.include_router(notif_prefs_router)
+app.include_router(notif_inbox_router)
+app.include_router(notif_send_router)

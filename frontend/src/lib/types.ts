@@ -1,9 +1,11 @@
+// Aptiro — TypeScript types modelled on FastAPI schemas.
+// Upgrade Phase 7 adds notification center types.
+
 // ── Enums ──────────────────────────────────────────────────────────────────
 export type SourceType =
   | "resume" | "linkedin" | "portfolio"
   | "article" | "public_article" | "manual_note" | "other";
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "do_not_use";
-// Fixed: was "green"|"blue"|"yellow"|"red" — missing purple/orange, had yellow
 export type ProvenanceColor = "blue" | "purple" | "green" | "orange" | "red";
 export type WorkMode = "remote" | "onsite" | "hybrid" | "any";
 export type Aggressiveness = "conservative" | "balanced" | "opportunistic";
@@ -26,13 +28,13 @@ export interface Source {
   filename?: string | null; extracted_text: string;
   parse_meta: ParseMeta; created_at: string; claim_count: number;
 }
-// Alias kept for any older imports that haven't been updated yet
 export type SourceRow = Source;
 
 export interface SourceRef {
   id: string; source_id: string; source_type: SourceType;
   section: string; snippet: string; page?: number | null; confidence: number;
 }
+
 export interface Claim {
   id: string; source_id: string; claim_text: string; claim_type: string;
   company?: string | null; role?: string | null; date_range?: string | null;
@@ -92,6 +94,8 @@ export interface Job {
   provider_source?: string | null; provider_job_id?: string | null;
   last_seen_at?: string | null; is_stale?: boolean;
 }
+export interface JobSourceInfo { id: string; mock: boolean; sample_count: number; }
+export interface JobSources { active_provider: string; available: JobSourceInfo[]; }
 
 // ── Matches ────────────────────────────────────────────────────────────────
 export interface ScoreComponent {
@@ -113,7 +117,7 @@ export type MatchFilter =
   | "all" | "strong" | "moderate" | "stretch"
   | "remote" | "above_target" | "new_this_week" | "missing_req" | "stale";
 
-// ── Saved Searches (Phase 5) ───────────────────────────────────────────────
+// ── Saved Searches ─────────────────────────────────────────────────────────
 export interface SavedSearch {
   id: string; owner_id: string; name: string; query: string;
   provider?: string | null; min_salary?: number | null; max_salary?: number | null;
@@ -209,16 +213,53 @@ export interface AuditEvent {
   duration_ms: number; at: string; request_id: string;
 }
 
-// ── Job Sources ────────────────────────────────────────────────────────────
-export interface JobSourceInfo { id: string; mock: boolean; sample_count: number; }
-export interface JobSources { active_provider: string; available: JobSourceInfo[]; }
+// ── Notifications (legacy preview, unchanged) ──────────────────────────────
+export type NotificationKind =
+  | "package_ready"
+  | "daily_digest"
+  | "integrity_alert"
+  | "weekly_digest"
+  | "match_threshold_alert"
+  | "followup_reminder";
+export type NotificationChannel = "email" | "slack" | "in_app";
+export interface NotificationPreview {
+  id: string; kind: NotificationKind; channel: NotificationChannel;
+  subject: string; body: string; package_id?: string | null;
+  status: string; created_at: string;
+}
+
+// ── Notifications (Upgrade Phase 7 — real center) ─────────────────────────
+export interface InAppNotification {
+  id: string; owner_id: string; kind: string;
+  subject: string; body: string; package_id: string | null;
+  is_read: boolean; created_at: string;
+}
+export interface NotifInboxOut {
+  items: InAppNotification[];
+  unread_count: number;
+}
+export interface NotificationPreference {
+  id: string; owner_id: string;
+  in_app_enabled: boolean;
+  email_enabled: boolean; email_address: string;
+  email_daily_digest: boolean; email_weekly_digest: boolean;
+  email_match_alerts: boolean; email_followup_reminders: boolean;
+  match_alert_threshold: number;
+  sms_enabled: boolean; sms_phone: string;
+  smtp_configured: boolean; twilio_configured: boolean;
+  created_at: string; updated_at: string;
+}
+export interface SendDigestOut {
+  subject: string; in_app_id: string | null;
+  email_sent: boolean; sms_sent: boolean; top_job_count: number;
+}
+export interface SendAlertOut {
+  alerts_generated: number; above_threshold: number; threshold: number;
+}
 
 // ── Research (Upgrade Phase 6) ─────────────────────────────────────────────
 export type ResearchUsageClass =
-  | "background_context"
-  | "claim_support"
-  | "framing_only"
-  | "not_usable";
+  | "background_context" | "claim_support" | "framing_only" | "not_usable";
 export type ResearchApprovalStatus = "pending" | "approved" | "rejected";
 export interface ResearchFinding {
   id: string; owner_id: string; query: string;
@@ -228,9 +269,7 @@ export interface ResearchFinding {
   prompted_by_claim_ids: string[]; provider: string;
   created_at: string; approved_at: string | null;
 }
-export interface ResearchQueryItem {
-  query: string; rationale: string; claim_ids: string[];
-}
+export interface ResearchQueryItem { query: string; rationale: string; claim_ids: string[]; }
 export interface GenerateQueriesOut {
   queries: ResearchQueryItem[]; approved_claim_count: number; message: string;
 }

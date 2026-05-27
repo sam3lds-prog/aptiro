@@ -2563,3 +2563,218 @@ def test_phase6_upgrade_health_field(client):
         f"upgrade_phases_shipped must include 6, got {shipped}. "
         "Did app_phase6_research_block.py get appended to app.py?"
     )
+
+
+# ===========================================================================
+# Upgrade Phase 7 — Real Notifications
+# ===========================================================================
+
+def test_notification_prefs_default(client):
+    """Default prefs: in_app on, email off, no address, threshold 0."""
+    p = client.get("/api/notifications/preferences").json()
+    assert p["in_app_enabled"] is True
+    assert p["email_enabled"] is False
+    assert p["email_address"] == ""
+    assert p["match_alert_threshold"] == 0
+    assert p["sms_enabled"] is False
+    assert p["sms_phone"] == ""
+    # SMTP / Twilio not configured in test environment
+    assert p["smtp_configured"] is False
+    assert p["twilio_configured"] is False
+
+
+def test_notification_prefs_update(client):
+    """PUT updates prefs; GET returns updated values."""
+    client.put("/api/notifications/preferences", json={
+        "email_enabled": True,
+        "email_address": "test@example.com",
+        "email_daily_digest": True,
+        "match_alert_threshold": 75,
+    })
+    p = client.get("/api/notifications/preferences").json()
+    assert p["email_enabled"] is True
+    assert p["email_address"] == "test@example.com"
+    assert p["email_daily_digest"] is True
+    assert p["match_alert_threshold"] == 75
+
+
+def test_notification_prefs_threshold_clamped(client):
+    """Threshold is clamped to 0-100."""
+    client.put("/api/notifications/preferences",
+               json={"match_alert_threshold": 200})
+    p = client.get("/api/notifications/preferences").json()
+    assert p["match_alert_threshold"] == 100
+
+    client.put("/api/notifications/preferences",
+               json={"match_alert_threshold": -5})
+    p = client.get("/api/notifications/preferences").json()
+    assert p["match_alert_threshold"] == 0
+
+
+def test_notification_inbox_starts_empty(client):
+    """Fresh user has an empty in-app inbox with unread_count 0."""
+    r = client.get("/api/notifications/inbox").json()
+    assert r["unread_count"] == 0
+    assert r["items"] == []
+
+
+def test_notification_send_digest_creates_inapp(client):
+    """POST /send/digest creates an in-app notification entry."""
+    _seed_and_job(client)
+    r = client.post("/api/notifications/send/digest")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["in_app_id"] is not None
+    # SMTP not configured in test env → email_sent must be False
+    assert d["email_sent"] is False
+    assert d["sms_sent"] is False
+    # In-app inbox now has one unread item
+    inbox = client.get("/api/notifications/inbox").json()
+    assert inbox["unread_count"] == 1
+    assert inbox["items"][0]["kind"] == "daily_digest"
+
+
+def test_notification_inbox_mark_read(client):
+    """Mark a single notification as read; unread_count decreases."""
+    _seed_and_job(client)
+    client.post("/api/notifications/send/digest")
+    inbox = client.get("/api/notifications/inbox").json()
+    assert inbox["unread_count"] == 1
+    nid = inbox["items"][0]["id"]
+
+    r = client.post(f"/api/notifications/inbox/{nid}/read")
+    assert r.status_code == 200
+    assert r.json()["is_read"] is True
+
+    inbox2 = client.get("/api/notifications/inbox").json()
+    assert inbox2["unread_count"] == 0
+    assert inbox2["items"][0]["is_read"] is True
+
+
+def test_notification_inbox_mark_all_read(client):
+    """POST /inbox/read-all clears all unread notifications."""
+    _seed_and_job(client)
+    client.post("/api/notifications/send/digest")
+    client.post("/api/notifications/send/digest")
+    inbox = client.get("/api/notifications/inbox").json()
+    assert inbox["unread_count"] == 2
+
+    r = client.post("/api/notifications/inbox/read-all")
+    assert r.status_code == 200
+    assert r.json()["unread_count"] == 0
+
+
+def test_notification_inbox_delete(client):
+    """DELETE removes a notification from the inbox entirely."""
+    _seed_and_job(client)
+    client.post("/api/notifications/send/digest")
+    inbox = client.get("/api/notifications/inbox").json()
+    nid = inbox["items"][0]["id"]
+
+    r = client.delete(f"/api/notifications/inbox/{nid}")
+    assert r.status_code == 204
+
+    inbox2 = client.get("/api/notifications/inbox").json()
+    assert len(inbox2["items"]) == 0
+
+
+def test_notification_match_alert_no_threshold(client):
+    """Match alert is a no-op when threshold is 0 (default)."""
+    _seed_and_job(client)
+    r = client.post("/api/notifications/send/match-alert").json()
+    assert r["alerts_generated"] == 0
+    assert r["threshold"] == 0
+
+
+def test_notification_match_alert_with_low_threshold(client):
+    """Match alert with threshold=1 evaluates jobs and may fire alerts."""
+    _seed_and_job(client)
+    client.put("/api/notifications/preferences",
+               json={"match_alert_threshold": 1})
+    r = client.post("/api/notifications/send/match-alert").json()
+    assert r["threshold"] == 1
+    # above_threshold count is non-negative (scoring is deterministic mock)
+    assert r["above_threshold"] >= 0
+
+
+def test_notification_email_not_sent_without_smtp(client):
+    """Enabling email prefs does NOT cause sends without SMTP config."""
+    _seed_and_job(client)
+    client.put("/api/notifications/preferences", json={
+        "email_enabled": True,
+        "email_address": "user@example.com",
+        "email_daily_digest": True,
+    })
+    r = client.post("/api/notifications/send/digest").json()
+    # Test env has no SMTP config → email_sent must remain False
+    assert r["email_sent"] is False
+
+
+def test_notification_sms_not_sent_without_twilio(client):
+    """Enabling SMS prefs does NOT cause sends without Twilio config."""
+    _seed_and_job(client)
+    client.put("/api/notifications/preferences", json={
+        "sms_enabled": True,
+        "sms_phone": "+15550001234",
+    })
+    r = client.post("/api/notifications/send/digest").json()
+    assert r["sms_sent"] is False
+
+
+def test_notification_channels_still_no_external_send(client):
+    """Existing /channels contract: sends_externally stays False in test env."""
+    r = client.get("/api/notifications/channels").json()
+    assert r["sends_externally"] is False
+
+
+def test_notification_prefs_roundtrip(client):
+    """Full prefs roundtrip: set all fields, read them back correctly."""
+    client.put("/api/notifications/preferences", json={
+        "email_enabled": True,
+        "email_address": "rt@example.com",
+        "email_daily_digest": True,
+        "email_weekly_digest": False,
+        "email_match_alerts": True,
+        "email_followup_reminders": True,
+        "match_alert_threshold": 80,
+        "sms_enabled": False,
+        "sms_phone": "",
+    })
+    p = client.get("/api/notifications/preferences").json()
+    assert p["email_address"] == "rt@example.com"
+    assert p["email_daily_digest"] is True
+    assert p["email_match_alerts"] is True
+    assert p["email_followup_reminders"] is True
+    assert p["match_alert_threshold"] == 80
+    assert p["sms_enabled"] is False
+
+
+def test_phase7_migration_chain_extends_to_0009():
+    """0009_phase7_notifications is the new head and chains to 0008."""
+    import pathlib as _pathlib
+    import importlib.util as _ilu2
+    vdir = _pathlib.Path(__file__).parent / "alembic" / "versions"
+    revs = {}
+    for f in sorted(vdir.glob("0*.py")):
+        spec = _ilu2.spec_from_file_location(f.stem, f)
+        m = _ilu2.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        revs[getattr(m, "revision", None)] = getattr(m, "down_revision", None)
+
+    assert "0009_phase7_notifications" in revs, (
+        "0009_phase7_notifications not found in alembic/versions/. "
+        "Did you copy the migration file?"
+    )
+    assert revs["0009_phase7_notifications"] == "0008_phase6_public_research", (
+        "0009 must chain back to 0008_phase6_public_research"
+    )
+
+
+def test_phase7_upgrade_health_field(client):
+    """Health endpoint advertises upgrade_phases_shipped includes 7."""
+    h = client.get("/api/health").json()
+    shipped = h.get("upgrade_phases_shipped", [])
+    assert 7 in shipped, (
+        f"upgrade_phases_shipped must include 7, got {shipped}. "
+        "Did the patcher update the health endpoint?"
+    )

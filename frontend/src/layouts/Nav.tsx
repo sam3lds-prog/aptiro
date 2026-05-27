@@ -1,12 +1,15 @@
 import { NavLink } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
 import { cn } from "@/lib/cn";
 import { useAuth } from "@/stores/auth";
+import { api } from "@/lib/api";
+import type { NotifInboxOut } from "@/lib/types";
 
-const NAV: { to: string; label: string; section?: string }[] = [
+const NAV: { to: string; label: string; section?: string; badge?: string }[] = [
   { to: "/",               label: "Dashboard" },
   { to: "/vault",          label: "Profile Vault" },
   { to: "/strategy",       label: "Strategy" },
-  // Phase 5: Jobs + Match Inbox + Saved Searches grouped together
+  // Jobs + Match Inbox
   { to: "/matches",        label: "Match Inbox",    section: "Jobs" },
   { to: "/jobs",           label: "Jobs" },
   { to: "/saved-searches", label: "Saved Searches" },
@@ -16,7 +19,8 @@ const NAV: { to: string; label: string; section?: string }[] = [
   { to: "/apply",          label: "Apply" },
   // Other
   { to: "/research",       label: "Research",       section: "Other" },
-  { to: "/activity",       label: "Activity",       section: "Other" },
+  { to: "/notifications",  label: "Notifications" },
+  { to: "/activity",       label: "Activity" },
   { to: "/privacy",        label: "Privacy" },
 ];
 
@@ -24,6 +28,17 @@ export function Nav() {
   const me = useAuth((s) => s.me);
   const signOut = useAuth((s) => s.signOut);
   const showLogout = !!me && !me.is_default;
+
+  // Poll unread count for the badge — low frequency, silent on error.
+  const inboxQ = useQuery<NotifInboxOut>({
+    queryKey: ["notif-inbox-count"],
+    queryFn: () => api<NotifInboxOut>("/notifications/inbox"),
+    refetchInterval: 60_000,
+    retry: false,
+    // Don't throw — the badge is non-critical UI
+    throwOnError: false,
+  });
+  const unread = inboxQ.data?.unread_count ?? 0;
 
   let lastSection = "";
 
@@ -44,6 +59,8 @@ export function Nav() {
         {NAV.map(({ to, label, section }) => {
           const showSection = section && section !== lastSection;
           if (showSection) lastSection = section!;
+          const isNotifications = to === "/notifications";
+
           return (
             <div key={to}>
               {showSection && (
@@ -54,14 +71,30 @@ export function Nav() {
                 end={to === "/"}
                 className={({ isActive }) =>
                   cn(
-                    "block px-3 py-2 rounded-md text-[13px] transition-colors",
+                    "flex items-center justify-between px-3 py-2 rounded-md text-[13px] transition-colors",
                     isActive
                       ? "bg-accent text-white font-medium"
                       : "text-sub hover:text-ink hover:bg-panel2"
                   )
                 }
               >
-                {label}
+                {({ isActive }) => (
+                  <>
+                    <span>{label}</span>
+                    {isNotifications && unread > 0 && (
+                      <span
+                        className={cn(
+                          "text-[10px] font-bold px-1.5 py-0.5 rounded-full leading-none",
+                          isActive
+                            ? "bg-white/20 text-white"
+                            : "bg-accent text-white"
+                        )}
+                      >
+                        {unread > 99 ? "99+" : unread}
+                      </span>
+                    )}
+                  </>
+                )}
               </NavLink>
             </div>
           );
