@@ -61,15 +61,9 @@ from app.core.config import (  # noqa: F401
     SEARCH_PROVIDER, NOTIFICATION_PROVIDER, SEED_ON_STARTUP,
     AUTH_ENABLED, DEFAULT_UID, DEFAULT_USER_EMAIL, _PW_ROUNDS,
 )
-# Per-request current user id. Defaults to the local user so code paths
-# with no auth context (tests, single-user mode) just work.
-_CURRENT_UID = ContextVar("aptiro_uid", default=DEFAULT_UID)
-
-
-def _uid():
-    return _CURRENT_UID.get()
-
-
+# APTIRO_PHASE9_PR4_IDENTITY_MARKER
+# Identity extracted to core/identity.py (Phase 9 PR-4)
+from app.core.identity import _CURRENT_UID, _uid  # noqa: F401
 # --- Phase 6: ops & observability (Phase 9 PR-2: moved to core/observability.py)
 import json as _json         # kept — may be used elsewhere in legacy
 import logging as _logging    # kept — may be used elsewhere in legacy
