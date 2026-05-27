@@ -1813,7 +1813,7 @@ def health():
     return {"status": "ok", "app": "Aptiro", "delivery": 4,
             "slice": "trust-export", "phase": 2,
             "phases_shipped": [1, 2, 3], "latest_phase": 4,
-            "upgrade_phases_shipped": [7, 4, 5, 6, 7],
+            "upgrade_phases_shipped": [7, 4, 5, 6, 7, 8],
             "providers": {"ai": AI_PROVIDER, "job": JOB_PROVIDER,
                           "search": SEARCH_PROVIDER,
                           "notification": NOTIFICATION_PROVIDER,
@@ -6763,3 +6763,718 @@ def send_match_alert(session: Session = Depends(get_session)):
 app.include_router(notif_prefs_router)
 app.include_router(notif_inbox_router)
 app.include_router(notif_send_router)
+
+# ===========================================================================
+# Upgrade Phase 8 — Auth hardening & launch security
+#
+# Deliverables (all additive):
+#   • Security headers on every response (CSP-lite, X-Frame, X-Content-Type, …)
+#   • In-memory rate limiter on /api/auth/login + /api/auth/register
+#     (off by default in dev/test; on in production or via explicit env var)
+#   • Token session expiry (opt-in via APTIRO_SESSION_HOURS; NULL = no expiry)
+#   • POST /api/auth/rotate   — issues a fresh token (and stamps expiry if configured)
+#   • DELETE /api/auth/account — confirmed hard-delete of account + all owned data
+#   • POST /api/packages/{id}/export/sign — creates a signed, expiring download link
+#   • GET  /api/exports/{token}           — serves the export without bearer auth
+#   • GET  /api/legal/privacy             — privacy policy text (markdown)
+#   • GET  /api/legal/terms               — terms of service text (markdown)
+#   • Production warning when APTIRO_ENV=production but APTIRO_AUTH not set
+#   • upgrade_phases_shipped gains 8
+#
+# Fast-follow (explicitly NOT this phase): email verification, password reset,
+# OAuth, refresh tokens.
+#
+# APTIRO_PHASE8_AUTH_HARDENING_MARKER — do not remove; idempotency guard.
+# ===========================================================================
+
+import collections as _collections8
+import threading as _threading8
+from datetime import timedelta as _timedelta8
+
+# ── Phase 8 config ─────────────────────────────────────────────────────────
+_P8_PROD = os.getenv("APTIRO_ENV", "").lower() in ("production", "prod")
+_P8_SESSION_HOURS = int(os.getenv("APTIRO_SESSION_HOURS", "0"))
+# Rate limits are DISABLED in dev/test unless production mode or explicit var.
+_P8_RATE_ENABLED = _P8_PROD or bool(os.getenv("APTIRO_AUTH_RATE_LIMIT"))
+_P8_AUTH_RATE = int(os.getenv("APTIRO_AUTH_RATE_LIMIT", "100"))   # /min per IP
+_P8_MUT_RATE  = int(os.getenv("APTIRO_MUTATE_RATE_LIMIT", "300")) # /min per IP
+# Export link signing secret. Auto-generated at startup if not set; set it in
+# production so signed links survive process restarts.
+_P8_EXPORT_SECRET = os.getenv("APTIRO_EXPORT_SECRET") or _secrets.token_hex(32)
+
+if _P8_PROD and not os.getenv("APTIRO_AUTH"):
+    print(
+        "[aptiro] WARNING: APTIRO_ENV=production but APTIRO_AUTH is not set. "
+        "Set APTIRO_AUTH=on for multi-user production deployments.",
+        file=_sys.stderr,
+    )
+
+# ── In-memory sliding-window rate limiter ─────────────────────────────────
+_P8_RL: dict = {}           # key -> deque of monotonic timestamps
+_P8_RL_LOCK = _threading8.Lock()
+
+
+def _p8_rate_ok(key: str, limit: int, window: int = 60) -> bool:
+    """Returns True if the request is within the rate limit, False if throttled."""
+    if not _P8_RATE_ENABLED:
+        return True
+    now = _time.monotonic()
+    with _P8_RL_LOCK:
+        dq = _P8_RL.setdefault(key, _collections8.deque())
+        while dq and now - dq[0] > window:
+            dq.popleft()
+        if len(dq) >= limit:
+            return False
+        dq.append(now)
+        return True
+
+
+# ── ExportToken model ──────────────────────────────────────────────────────
+
+# Phase 8 fix-A2: register token_expires_at on User.__table__
+# Adds the column to User.__table__ so SQLModel.metadata.create_all() creates
+# it on every engine — including the test fixture's separate in-memory DB.
+# The column is intentionally NOT on the User SQLModel Python class; raw SQL
+# is used for reads/writes (see _p8_token_expires / _p8_set_token_expiry).
+from sqlalchemy import Column as _p8_Column, DateTime as _p8_DateTime
+if "token_expires_at" not in User.__table__.columns:
+    User.__table__.append_column(
+        _p8_Column("token_expires_at", _p8_DateTime(), nullable=True)
+    )
+
+class ExportToken(SQLModel, table=True):
+    """Signed, expiring download link for a package export. No bearer auth needed."""
+    id: str = Field(default_factory=lambda: _uuidmod.uuid4().hex, primary_key=True)
+    owner_id: str = Field(index=True)
+    package_id: str
+    token_hash: str = Field(index=True)   # SHA-256 of raw token; raw never stored
+    format: str = "md"
+    artifact: str = "resume"
+    include_unsupported: bool = False
+    expires_at: datetime
+    created_at: datetime = Field(default_factory=_now)
+    used_at: Optional[datetime] = None
+
+
+# ── Phase 8 column additions (additive, idempotent) ────────────────────────
+def _p8_ensure_columns() -> None:
+    """Add token_expires_at to the user table (idempotent; SQLite + Postgres)."""
+    import sqlalchemy as _sa8
+    try:
+        insp = _sa8.inspect(engine)
+        for tname, colname, coldecl in [
+            ("user", "token_expires_at", "DATETIME"),
+        ]:
+            if tname not in insp.get_table_names():
+                continue
+            if colname in {c["name"] for c in insp.get_columns(tname)}:
+                continue
+            try:
+                with engine.connect() as _c8:
+                    _c8.execute(_sa8.text(
+                        f'ALTER TABLE "{tname}" ADD COLUMN "{colname}" {coldecl}'))
+                    _c8.commit()
+            except Exception as _ce8:
+                print(f"[aptiro] p8 col {tname}.{colname} skipped: {_ce8!r}",
+                      file=_sys.stderr)
+    except Exception as _e8:
+        print(f"[aptiro] p8_ensure_columns skipped: {_e8!r}", file=_sys.stderr)
+
+
+@app.on_event("startup")
+async def _p8_on_startup() -> None:
+    _p8_ensure_columns()
+    # Pick up ExportToken (and any other Phase 8 tables) in case init_db ran first
+    try:
+        SQLModel.metadata.create_all(engine)
+    except Exception:
+        pass
+
+
+# ── Token expiry helpers (raw SQL — token_expires_at not on User model class) ─
+def _p8_token_expires(token: str) -> Optional[datetime]:
+    """Return token_expires_at for the given bearer token, or None (= no expiry)."""
+    import sqlalchemy as _sa8x
+    s, gen = _mw_session()
+    try:
+        row = s.execute(
+            _sa8x.text('SELECT token_expires_at FROM "user" WHERE token = :t'),
+            {"t": token},
+        ).first()
+        if row and row[0]:
+            v = row[0]
+            return datetime.fromisoformat(v) if isinstance(v, str) else v
+    except Exception:
+        pass
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+    return None
+
+
+def _p8_set_token_expiry(token: str, hours: int) -> None:
+    """Stamp token_expires_at on a user record via raw SQL."""
+    import sqlalchemy as _sa8s
+    exp = _now() + _timedelta8(hours=hours)
+    s, gen = _mw_session()
+    try:
+        s.execute(
+            _sa8s.text(
+                'UPDATE "user" SET token_expires_at = :exp WHERE token = :t'
+            ),
+            {"exp": exp, "t": token},
+        )
+        s.commit()
+    except Exception as _e8s:
+        print(f"[aptiro] p8 set_expiry failed: {_e8s!r}", file=_sys.stderr)
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+
+# ── Security-headers + rate-limit + token-expiry middleware (outermost) ────
+@app.middleware("http")
+async def _p8_security_middleware(request, call_next):
+    from starlette.responses import JSONResponse as _JR8
+
+    path   = request.url.path
+    method = request.method
+    ip     = (request.client.host if request.client else None) or "unknown"
+
+    # 1. Rate limit: auth endpoints (login / register)
+    if path in ("/api/auth/login", "/api/auth/register"):
+        if not _p8_rate_ok(f"auth:{ip}", _P8_AUTH_RATE, 60):
+            return _JR8(
+                {"detail": "Too many requests — please wait before trying again."},
+                status_code=429,
+                headers={"Retry-After": "60"},
+            )
+
+    # 2. Rate limit: all other mutating endpoints
+    elif method in ("POST", "PUT", "PATCH", "DELETE") and path.startswith("/api/"):
+        if not _p8_rate_ok(f"mut:{ip}", _P8_MUT_RATE, 60):
+            return _JR8(
+                {"detail": "Too many requests."},
+                status_code=429,
+                headers={"Retry-After": "60"},
+            )
+
+    # 3. Token expiry check (only when auth is on AND session expiry is configured)
+    if AUTH_ENABLED and _P8_SESSION_HOURS > 0:
+        token = _bearer(request)
+        if (token
+                and path.startswith("/api/")
+                and not path.startswith("/api/auth/")
+                and not path.startswith("/api/exports/")):
+            expires = _p8_token_expires(token)
+            if expires is not None and expires < _now():
+                return _JR8(
+                    {"detail": "Session expired. Please sign in again."},
+                    status_code=401,
+                )
+
+    response = await call_next(request)
+
+    # 4. Security headers (always injected, never overwrite if already set)
+    h = response.headers
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("X-XSS-Protection", "1; mode=block")
+    h.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    h.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if _P8_PROD:
+        h.setdefault(
+            "Strict-Transport-Security",
+            "max-age=63072000; includeSubDomains; preload",
+        )
+
+    return response
+
+
+# ── Auth Phase 8 router: token rotation + confirmed account deletion ───────
+_auth8_router = APIRouter(prefix="/api/auth", tags=["auth-p8"])
+
+
+class RotateOut(BaseModel):
+    token: str
+    expires_at: Optional[str] = None
+
+
+@_auth8_router.post("/rotate", response_model=RotateOut)
+def p8_rotate_token(session: Session = Depends(get_session)):
+    """Issue a fresh bearer token for the current user (rotation).
+    When APTIRO_SESSION_HOURS > 0 the new token carries an expiry.
+    Not available for the local default user (auth must be on)."""
+    uid = _uid()
+    if uid == DEFAULT_UID:
+        raise HTTPException(
+            403,
+            "Token rotation is not available for the local default user. "
+            "Enable auth (APTIRO_AUTH=on) and log in with a real account.",
+        )
+    u = session.get(User, uid)
+    if not u:
+        raise HTTPException(404, "User not found")
+    u.token = _new_token()
+    session.add(u)
+    session.commit()
+    session.refresh(u)
+    exp: Optional[str] = None
+    if _P8_SESSION_HOURS > 0:
+        _p8_set_token_expiry(u.token, _P8_SESSION_HOURS)
+        exp = (_now() + _timedelta8(hours=_P8_SESSION_HOURS)).isoformat()
+    return RotateOut(token=u.token, expires_at=exp)
+
+
+class AccountDeleteBody(BaseModel):
+    confirm: str  # caller must pass "DELETE MY ACCOUNT" exactly
+
+
+@_auth8_router.delete("/account", status_code=204)
+def p8_delete_account(
+    body: AccountDeleteBody, session: Session = Depends(get_session)
+):
+    """Hard-delete the calling user's account and every piece of owned data.
+
+    Requires ``confirm = "DELETE MY ACCOUNT"`` in the request body.
+    Cannot be called by the default local user (no account to delete).
+    This is irreversible — data cannot be recovered after this call.
+    """
+    if body.confirm != "DELETE MY ACCOUNT":
+        raise HTTPException(
+            422,
+            'Set "confirm" to exactly "DELETE MY ACCOUNT" to proceed. '
+            "This action is permanent and cannot be undone.",
+        )
+    uid = _uid()
+    if uid == DEFAULT_UID:
+        raise HTTPException(
+            403,
+            "The local default user account cannot be deleted. "
+            "Enable auth and use a real account.",
+        )
+
+    # Collect owned-model classes defensively (later-phase models may not exist
+    # in all deployments; KeyError is caught per-model).
+    _p8_del_models = [
+        Source, ProfileClaim, Strategy, JobPosting,
+        ApplicationPackage, Application, ExportToken,
+    ]
+    for _mn8 in [
+        "SavedJobSearch", "UserNotificationPreference",
+        "InAppNotification", "PublicResearchFinding",
+    ]:
+        try:
+            _p8_del_models.append(globals()[_mn8])
+        except KeyError:
+            pass
+
+    for _dm8 in _p8_del_models:
+        try:
+            for _obj8 in session.exec(
+                select(_dm8).where(_dm8.owner_id == uid)
+            ).all():
+                session.delete(_obj8)
+        except Exception:
+            pass  # model may not exist in this deployment
+
+    u = session.get(User, uid)
+    if u:
+        session.delete(u)
+    session.commit()
+    return Response(status_code=204)
+
+
+app.include_router(_auth8_router)
+
+
+# ── Export signing router ──────────────────────────────────────────────────
+_pkg8_router = APIRouter(prefix="/api/packages", tags=["exports-p8"])
+
+
+class SignedExportLinkOut(BaseModel):
+    token: str
+    url: str
+    expires_at: str
+    format: str
+    artifact: str
+
+
+@_pkg8_router.post("/{pkg_id}/export/sign", response_model=SignedExportLinkOut)
+def p8_sign_export_link(
+    pkg_id: str,
+    format: str = Query("md"),
+    artifact: str = Query("resume"),
+    include_unsupported: bool = Query(False),
+    ttl_minutes: int = Query(60, ge=1, le=10080),
+    session: Session = Depends(get_session),
+):
+    """Create a signed, expiring download link for a package export.
+
+    The returned ``url`` (/api/exports/{token}) can be shared and visited
+    without a bearer token. The link expires after ``ttl_minutes`` (default 60,
+    max 7 days = 10 080 minutes).
+    """
+    pkg = _get_owned(session, ApplicationPackage, pkg_id)
+    if not pkg:
+        raise HTTPException(404, "Package not found")
+    if format not in exporting.FORMATS:
+        raise HTTPException(
+            400,
+            f"Unsupported format '{format}'. Choose one of: "
+            + ", ".join(exporting.FORMATS),
+        )
+    if artifact not in ("resume", "cover_letter", "both"):
+        raise HTTPException(400, "artifact must be resume | cover_letter | both")
+
+    raw  = _secrets.token_urlsafe(32)
+    hashed = _hashlib.sha256(raw.encode()).hexdigest()
+    exp  = _now() + _timedelta8(minutes=ttl_minutes)
+    et   = ExportToken(
+        owner_id=_uid(),
+        package_id=pkg_id,
+        token_hash=hashed,
+        format=format,
+        artifact=artifact,
+        include_unsupported=include_unsupported,
+        expires_at=exp,
+    )
+    session.add(et)
+    session.commit()
+    return SignedExportLinkOut(
+        token=raw,
+        url=f"/api/exports/{raw}",
+        expires_at=exp.isoformat(),
+        format=format,
+        artifact=artifact,
+    )
+
+
+app.include_router(_pkg8_router)
+
+
+# ── Signed-export serve router (GET only; bearer auth not required) ────────
+_exports8_router = APIRouter(prefix="/api/exports", tags=["exports-p8-serve"])
+
+
+@_exports8_router.get("/{raw_token}")
+def p8_serve_export(raw_token: str, session: Session = Depends(get_session)):
+    """Serve a previously signed export file without requiring a bearer token.
+
+    Returns 403 if the token is invalid, 410 if it has expired, 404 if the
+    originating package no longer exists.
+    """
+    hashed = _hashlib.sha256(raw_token.encode()).hexdigest()
+    et = session.exec(
+        select(ExportToken).where(ExportToken.token_hash == hashed)
+    ).first()
+    if not et:
+        raise HTTPException(403, "Invalid or unrecognised export link")
+    _et_exp = et.expires_at
+    if _et_exp is not None and _et_exp.tzinfo is None:
+        _et_exp = _et_exp.replace(tzinfo=timezone.utc)
+    if _et_exp < _now():
+        raise HTTPException(410, "This export link has expired")
+
+    pkg = session.get(ApplicationPackage, et.package_id)
+    if not pkg:
+        raise HTTPException(404, "The originating package no longer exists")
+
+    if et.format == exporting.ATS_PROFILE:
+        content, ext = exporting.render_ats(
+            _export_model(session, pkg, et.include_unsupported), et.artifact
+        )
+    elif et.format not in exporting.FORMATS:
+        raise HTTPException(400, f"Invalid format on stored token: {et.format}")
+    else:
+        model = _export_model(session, pkg, et.include_unsupported)
+        try:
+            content, ext = exporting.render(model, et.format, et.artifact)
+        except exporting.ExportUnavailable as _eu8:
+            raise HTTPException(501, str(_eu8))
+
+    safe  = re.sub(r"[^A-Za-z0-9]+", "_",
+                   f"{pkg.company or 'aptiro'}_{et.artifact}").strip("_")
+    fname = f"{safe or 'aptiro_export'}.{ext}"
+
+    # Mark token as used (once; subsequent calls still work until expiry)
+    if et.used_at is None:
+        et.used_at = _now()
+        session.add(et)
+        session.commit()
+
+    return Response(
+        content=content,
+        media_type=EXPORT_MEDIA.get(ext, "application/octet-stream"),
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+app.include_router(_exports8_router)
+
+
+# ── Legal docs router ──────────────────────────────────────────────────────
+_legal8_router = APIRouter(prefix="/api/legal", tags=["legal"])
+
+_P8_PRIVACY_TEXT = """\
+# Aptiro Privacy Policy
+
+**Last updated: 2026-05-27**
+
+## 1. What Aptiro Is
+
+Aptiro is a local-first, self-hosted job-application cockpit. By default, all
+data lives on your own machine or private server. No personal data is transmitted
+to third-party services unless you explicitly configure external providers.
+
+## 2. Data Stored
+
+| Category | What | Where |
+|---|---|---|
+| Account | Email + PBKDF2-hashed password | Local DB only |
+| Career content | Résumé text, claims, evidence, packages | Local DB only |
+| Audit trail | Append-only server log of mutations | Local DB only |
+
+Credentials are never logged, never exported in the privacy bundle, and never
+transmitted to Anthropic or any other party.
+
+## 3. Optional Third-Party Services (all opt-in)
+
+- **Anthropic AI** — used only when `APTIRO_AI_PROVIDER=anthropic` + `ANTHROPIC_API_KEY`
+  are both set. Text sent is strictly limited to the specific career claims
+  being rewritten; no personal identifiers are included.
+- **SMTP** — used only when `APTIRO_SMTP_HOST` is configured. You control
+  the sending server.
+- **Twilio SMS** — used only when `APTIRO_TWILIO_SID/TOKEN/FROM` are configured
+  and you have explicitly enabled SMS in notification preferences.
+
+No analytics trackers. No advertising networks. No telemetry.
+
+## 4. Data Retention & Deletion
+
+- **Delete all data (keep account):** Profile Vault → Privacy → Delete all my data,
+  or `DELETE /api/privacy/data`.
+- **Delete account entirely:** Settings → Delete Account, or
+  `DELETE /api/auth/account` with `{"confirm": "DELETE MY ACCOUNT"}`.
+
+Both operations are immediate and irreversible.
+
+## 5. Security Practices
+
+- Passwords: salted PBKDF2-HMAC-SHA256 (120 000 rounds, stdlib)
+- Bearer tokens: cryptographically random 256-bit values
+- Signed export links: SHA-256 hashed, configurable TTL (default 60 min)
+- Session expiry: opt-in via `APTIRO_SESSION_HOURS`
+- Rate limiting: enabled in production mode
+- Security headers: `X-Content-Type-Options`, `X-Frame-Options`,
+  `X-XSS-Protection`, `Referrer-Policy`, `Permissions-Policy`,
+  HSTS in production
+
+## 6. Open Source
+
+Aptiro is open-source software. Review the code, file issues, or self-host at
+https://github.com/sam3lds-prog/aptiro.
+"""
+
+_P8_TERMS_TEXT = """\
+# Aptiro Terms of Service
+
+**Last updated: 2026-05-27**
+
+## 1. Acceptance
+
+By running or using Aptiro you agree to these terms.
+
+## 2. Permitted Use
+
+Aptiro is a personal job-application preparation tool.
+
+- **Allowed:** Uploading your own résumé content, building tailored application
+  packages from that content, and exporting them for your own job applications.
+- **Not allowed:** Fabricating claims, impersonating others, bulk or automated
+  application submission, or scraping third-party sites through Aptiro.
+
+## 3. The Non-Negotiables (load-bearing product behaviour)
+
+These are not configurable overrides — they are core to what Aptiro is:
+
+1. **No auto-submit.** Aptiro never submits anything on your behalf. Every
+   action requires explicit confirmation.
+2. **No fabrication.** The AI assist system is constrained to approved,
+   evidence-backed claims only. AI outputs that introduce facts absent from your
+   verified career history are blocked before being presented.
+3. **No scraping.** LinkedIn, Indeed, and other auth-walled sites are explicitly
+   excluded from all job-import paths.
+
+## 4. Disclaimer
+
+Aptiro is provided "as is" without warranty of any kind. Career outcomes are not
+guaranteed. The export gate and provenance system reduce the risk of accidental
+inaccuracies but do not eliminate your responsibility to review content before
+submitting applications.
+
+## 5. License
+
+Aptiro is open-source software distributed under the project license. See the
+repository for details.
+"""
+
+
+@_legal8_router.get("/privacy")
+def p8_privacy_policy():
+    """Serve the Aptiro privacy policy as a markdown string."""
+    return {"content": _P8_PRIVACY_TEXT, "format": "markdown",
+            "last_updated": "2026-05-27"}
+
+
+@_legal8_router.get("/terms")
+def p8_terms_of_service():
+    """Serve the Aptiro terms of service as a markdown string."""
+    return {"content": _P8_TERMS_TEXT, "format": "markdown",
+            "last_updated": "2026-05-27"}
+
+
+app.include_router(_legal8_router)
+
+
+# ── Update upgrade_phases_shipped ──────────────────────────────────────────
+try:
+    _UPGRADE_PHASES_SHIPPED  # noqa: F821 — defined by earlier phase blocks
+except NameError:
+    _UPGRADE_PHASES_SHIPPED = []
+
+if 8 not in _UPGRADE_PHASES_SHIPPED:
+    _UPGRADE_PHASES_SHIPPED = list(_UPGRADE_PHASES_SHIPPED) + [8]
+
+# ===========================================================================
+# Phase 8 Round 4 fix — monkey-patches that bypass text-replacement issues.
+# APTIRO_PHASE8_ROUND4_FIX_MARKER — do not remove (idempotency guard).
+# ===========================================================================
+
+# ---- Fix 1: tz-safe wrapper around _p8_token_expires ---------------------
+# SQLite strips tzinfo on round-trip; the middleware compares with _now()
+# which is tz-aware, so a naive return value crashes the comparison.
+# Python looks up names in module globals at call time, so simply
+# rebinding _p8_token_expires here shadows the original and the
+# middleware automatically uses this wrapped version.
+_p8_token_expires_v1 = _p8_token_expires
+
+
+def _p8_token_expires(token):  # type: ignore[no-redef]
+    v = _p8_token_expires_v1(token)
+    if v is not None and hasattr(v, "tzinfo") and v.tzinfo is None:
+        v = v.replace(tzinfo=timezone.utc)
+    return v
+
+
+# ---- Fix 2: replace DELETE /api/auth/account with raw-SQL deletion -------
+# The ORM-based delete triggers SET-NULL cascade on profileclaim.source_id
+# (which is NOT NULL), poisons the session with PendingRollbackError, and
+# returns 500. Raw SQL deletes in dependency order bypass the cascade.
+from fastapi.routing import APIRoute as _APIRoute_p8r4
+
+# Remove the original DELETE /api/auth/account route(s)
+_p8r4_to_remove = []
+for _r in list(app.router.routes):
+    if (isinstance(_r, _APIRoute_p8r4)
+        and _r.path == "/api/auth/account"
+        and "DELETE" in _r.methods):
+        _p8r4_to_remove.append(_r)
+
+for _r in _p8r4_to_remove:
+    try:
+        app.router.routes.remove(_r)
+    except ValueError:
+        pass
+
+
+@app.delete("/api/auth/account", status_code=204, tags=["auth-p8-v2"])
+def _p8r4_delete_account(
+    body: AccountDeleteBody, session: Session = Depends(get_session)
+):
+    """Confirmed hard-delete (round-4 raw-SQL version)."""
+    if body.confirm != "DELETE MY ACCOUNT":
+        raise HTTPException(
+            422,
+            'Set "confirm" to exactly "DELETE MY ACCOUNT" to proceed. '
+            "This action is permanent and cannot be undone.",
+        )
+    uid = _uid()
+    if uid == DEFAULT_UID:
+        raise HTTPException(
+            403,
+            "The local default user account cannot be deleted. "
+            "Enable auth and use a real account.",
+        )
+
+    import sqlalchemy as _sa_p8r4
+    insp = _sa_p8r4.inspect(session.get_bind())
+    _existing = set(insp.get_table_names())
+
+    # (table, where_clause) — children first, then parents
+    _p8r4_dels = [
+        ("sourceref",
+         "claim_id IN (SELECT id FROM profileclaim WHERE owner_id = :uid)"),
+        ("sourceref",
+         "source_id IN (SELECT id FROM source WHERE owner_id = :uid)"),
+        ("profileclaim", "owner_id = :uid"),
+        ("agentcritique",
+         "run_id IN (SELECT id FROM agentrun "
+         "WHERE package_id IN (SELECT id FROM applicationpackage "
+         "WHERE owner_id = :uid))"),
+        ("agentrun",
+         "package_id IN (SELECT id FROM applicationpackage "
+         "WHERE owner_id = :uid)"),
+        ("packagebullet",
+         "package_id IN (SELECT id FROM applicationpackage "
+         "WHERE owner_id = :uid)"),
+        ("applysession",
+         "package_id IN (SELECT id FROM applicationpackage "
+         "WHERE owner_id = :uid)"),
+        ("inappnotification", "owner_id = :uid"),
+        ("usernotificationpreference", "owner_id = :uid"),
+        ("publicresearchfinding", "owner_id = :uid"),
+        ("notificationpreview", "owner_id = :uid"),
+        ("savedjobsearch", "owner_id = :uid"),
+        ("exporttoken", "owner_id = :uid"),
+        ("source", "owner_id = :uid"),
+        ("applicationpackage", "owner_id = :uid"),
+        ("application", "owner_id = :uid"),
+        ("strategy", "owner_id = :uid"),
+        ("jobposting", "owner_id = :uid"),
+    ]
+    for _tbl, _where in _p8r4_dels:
+        if _tbl in _existing:
+            try:
+                session.execute(
+                    _sa_p8r4.text(
+                        'DELETE FROM "' + _tbl + '" WHERE ' + _where
+                    ),
+                    {"uid": uid},
+                )
+            except Exception:
+                # Defensive: roll back to a clean state and continue.
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+
+    if "user" in _existing:
+        try:
+            session.execute(
+                _sa_p8r4.text('DELETE FROM "user" WHERE id = :uid'),
+                {"uid": uid},
+            )
+        except Exception:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+
+    session.commit()
+    return Response(status_code=204)
+

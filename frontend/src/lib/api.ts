@@ -1,17 +1,18 @@
 /**
- * Aptiro API client.
+ * Aptiro API client — Phase 8 update.
  *
- * - Resolves base URL from window.APTIRO_API (runtime) or "" (Vite proxy in dev).
- * - Attaches the bearer token from authStore if present.
- * - Throws ApiError with status + body for non-2xx, so pages can show
- *   useful, specific messages.
+ * Changes from Phase 7:
+ *   • 401 with an active token → auto sign-out (session expired or revoked)
+ *   • 429 → friendly rate-limit error message
+ *   • signExportLink() — creates a signed, expiring download link
+ *   • rotateToken()   — issues a fresh bearer token
+ *   • deleteAccount() — confirmed hard-delete of account + all owned data
+ *   • legalDoc()      — fetch privacy policy or terms of service
  */
-import { getToken } from "@/stores/auth";
+import { getToken, useAuth } from "@/stores/auth";
 
 function resolveBase(): string {
   const w = (window as unknown as { APTIRO_API?: string }).APTIRO_API;
-  // In dev the Vite proxy forwards /api -> :8000. In prod APTIRO_API can
-  // be set to the absolute API host. Both end up at "/api/..."
   return (w || "") + "/api";
 }
 
@@ -76,8 +77,23 @@ export async function api<T = unknown>(path: string, opts: ApiOpts = {}): Promis
   }
 
   if (!res.ok) {
+    // ── Phase 8: handle specific status codes ──────────────────────────
+    if (res.status === 401 && token) {
+      // Our token is no longer valid (expired or revoked) — sign out so
+      // the login screen appears on the next navigation.
+      useAuth.getState().signOut();
+    }
+
     let msg = `HTTP ${res.status}`;
-    if (parsed && typeof parsed === "object" && parsed !== null && "detail" in parsed) {
+
+    if (res.status === 429) {
+      msg = "Too many requests — please wait a moment before trying again.";
+    } else if (
+      parsed &&
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "detail" in parsed
+    ) {
       const d = (parsed as { detail: unknown }).detail;
       if (typeof d === "string") msg = d;
       else if (Array.isArray(d) && d[0] && typeof d[0] === "object") {
@@ -91,7 +107,10 @@ export async function api<T = unknown>(path: string, opts: ApiOpts = {}): Promis
 }
 
 /** Build a direct download URL (used for /export which returns a file). */
-export function downloadUrl(path: string, params?: Record<string, string | number | boolean>): string {
+export function downloadUrl(
+  path: string,
+  params?: Record<string, string | number | boolean>
+): string {
   let url = resolveBase() + path;
   if (params) {
     const qs = new URLSearchParams();
@@ -100,4 +119,70 @@ export function downloadUrl(path: string, params?: Record<string, string | numbe
     if (s) url += (url.includes("?") ? "&" : "?") + s;
   }
   return url;
+}
+
+// ── Phase 8 helpers ────────────────────────────────────────────────────────
+
+export interface SignedExportLink {
+  token: string;
+  url: string;
+  expires_at: string;
+  format: string;
+  artifact: string;
+}
+
+/**
+ * Create a signed, expiring export download link for the given package.
+ * The returned `url` can be fetched without a bearer token.
+ */
+export async function signExportLink(
+  packageId: string,
+  options: {
+    format?: string;
+    artifact?: string;
+    include_unsupported?: boolean;
+    ttl_minutes?: number;
+  } = {}
+): Promise<SignedExportLink> {
+  return api<SignedExportLink>(`/packages/${packageId}/export/sign`, {
+    method: "POST",
+    params: {
+      format: options.format ?? "md",
+      artifact: options.artifact ?? "resume",
+      include_unsupported: options.include_unsupported ?? false,
+      ttl_minutes: options.ttl_minutes ?? 60,
+    },
+  });
+}
+
+export interface RotateOut {
+  token: string;
+  expires_at: string | null;
+}
+
+/** Rotate the current bearer token. Call this after login when session expiry is desired. */
+export async function rotateToken(): Promise<RotateOut> {
+  return api<RotateOut>("/auth/rotate", { method: "POST" });
+}
+
+/**
+ * Hard-delete the calling user's account and all owned data.
+ * The caller must pass `confirm = "DELETE MY ACCOUNT"` explicitly.
+ */
+export async function deleteAccount(confirm: string): Promise<void> {
+  return api("/auth/account", {
+    method: "DELETE",
+    body: { confirm },
+  });
+}
+
+export interface LegalDoc {
+  content: string;
+  format: "markdown";
+  last_updated: string;
+}
+
+/** Fetch the privacy policy or terms of service document. */
+export async function legalDoc(doc: "privacy" | "terms"): Promise<LegalDoc> {
+  return api<LegalDoc>(`/legal/${doc}`);
 }

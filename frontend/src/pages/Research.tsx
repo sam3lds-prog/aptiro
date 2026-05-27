@@ -9,6 +9,18 @@
  * Safety principle mirrored from Truth Vault:
  *   Approved findings suggest framing. They NEVER become claims or bullets
  *   automatically. The UI makes this unmistakably clear at every point.
+ *
+ * FIXES in this version:
+ *   1. runResearch + patchFinding: removed JSON.stringify() — api() already
+ *      serialises the body. Double-encoding caused FastAPI 422 errors.
+ *   2. All <select> elements: added style={{ colorScheme:"dark" }} so native
+ *      <option> elements render readable text in dark-themed browsers.
+ *      (CSS custom properties don't propagate into native option lists.)
+ *   3. Added "Results/query:" label next to the limitPerQuery select so users
+ *      know it controls the next Run Research call, not a live filter.
+ *   4. Added "Filter:" label + "Clear filters" shortcut for better UX.
+ *   5. Empty state now distinguishes "no findings at all" from "nothing
+ *      matches the current filter".
  */
 
 import { useState, useCallback } from "react";
@@ -213,10 +225,13 @@ const fetchFindings = (approvalFilter: string, usageFilter: string) => {
   return api<ResearchFinding[]>(`/research/findings${qs ? "?" + qs : ""}`);
 };
 
+// FIX 1: body is now a plain object — api() calls JSON.stringify() itself.
+// Previously: body: JSON.stringify({...}) → api() would stringify again →
+// FastAPI received a double-encoded string → 422 Unprocessable Entity.
 const runResearch = (limitPerQuery: number) =>
   api<RunResearchOut>("/research/profile-contributions", {
     method: "POST",
-    body: JSON.stringify({ limit_per_query: limitPerQuery }),
+    body: { limit_per_query: limitPerQuery },
   });
 
 const patchFinding = (
@@ -225,7 +240,7 @@ const patchFinding = (
 ) =>
   api<ResearchFinding>(`/research/findings/${id}`, {
     method: "PATCH",
-    body: JSON.stringify(body),
+    body, // FIX 1: was JSON.stringify(body)
   });
 
 const deleteFinding = (id: string) =>
@@ -659,26 +674,45 @@ export default function Research() {
     total: findings?.length ?? 0,
   };
 
+  const hasActiveFilter = !!(approvalFilter || usageFilter);
+  const clearFilters = () => { setApprovalFilter(""); setUsageFilter(""); };
+
   return (
     <div className="flex flex-col h-full p-6 gap-4 overflow-hidden">
       <PageHeader
         title="Public Research"
         subtitle="Find public context about your work. Approve what's safe — it contextualises your story but never invents claims."
       >
+        {/* FIX 2 + 3: Added "Results/query:" label and colorScheme:"dark"
+            so the dropdown is readable and its purpose is clear. */}
         <div className="flex items-center gap-2">
-          <div className="relative">
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs text-ink-muted whitespace-nowrap">
+              Results/query:
+            </span>
+            <div className="relative">
               <select
-            className="text-xs bg-surface-2 border border-surface-3 rounded-lg px-2 py-1.5 text-ink focus:outline-none focus:ring-2 focus:ring-brand/50 appearance-none pr-7"
-            value={limitPerQuery}
-            onChange={(e) => setLimitPerQuery(Number(e.target.value))}
-          >
-            <option value={1}>1 result/query</option>
-            <option value={2}>2 results/query</option>
-            <option value={3}>3 results/query</option>
-            <option value={5}>5 results/query</option>
-          </select>
-              <svg className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-ink-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>
+                className="text-xs bg-surface-2 border border-surface-3 rounded-lg px-2 py-1.5 text-ink focus:outline-none focus:ring-2 focus:ring-brand/50 appearance-none pr-7"
+                style={{ colorScheme: "dark" }}
+                value={limitPerQuery}
+                onChange={(e) => setLimitPerQuery(Number(e.target.value))}
+              >
+                <option value={1}>1</option>
+                <option value={2}>2</option>
+                <option value={3}>3</option>
+                <option value={5}>5</option>
+              </select>
+              <svg
+                className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-ink-muted"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={2}
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
             </div>
+          </div>
           <Button
             variant="primary"
             size="sm"
@@ -768,35 +802,63 @@ export default function Research() {
 
         {/* Center: findings feed */}
         <div className="flex flex-col flex-1 min-w-0 gap-3 overflow-hidden">
-          {/* Filters */}
-          <div className="flex gap-2">
+          {/* FIX 4: Added "Filter:" label and "Clear filters" shortcut.
+              colorScheme:"dark" fixes option text visibility. */}
+          <div className="flex gap-2 items-center flex-wrap">
+            <span className="text-xs text-ink-muted">Filter:</span>
             <div className="relative">
               <select
-              className="text-xs bg-surface-1 border border-surface-2 rounded-lg px-2 py-1.5 text-ink focus:outline-none focus:ring-2 focus:ring-brand/50 appearance-none pr-7"
-              value={approvalFilter}
-              onChange={(e) => setApprovalFilter(e.target.value)}
-            >
-              <option value="">All statuses</option>
-              <option value="pending">Pending</option>
-              <option value="approved">Approved</option>
-              <option value="rejected">Rejected</option>
-            </select>
-              <svg className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-ink-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>
+                className="text-xs bg-surface-1 border border-surface-2 rounded-lg px-2 py-1.5 text-ink focus:outline-none focus:ring-2 focus:ring-brand/50 appearance-none pr-7"
+                style={{ colorScheme: "dark" }}
+                value={approvalFilter}
+                onChange={(e) => setApprovalFilter(e.target.value)}
+              >
+                <option value="">All statuses</option>
+                <option value="pending">Pending</option>
+                <option value="approved">Approved</option>
+                <option value="rejected">Rejected</option>
+              </select>
+              <svg
+                className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-ink-muted"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={2}
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
             </div>
             <div className="relative">
               <select
-              className="text-xs bg-surface-1 border border-surface-2 rounded-lg px-2 py-1.5 text-ink focus:outline-none focus:ring-2 focus:ring-brand/50 appearance-none pr-7"
-              value={usageFilter}
-              onChange={(e) => setUsageFilter(e.target.value)}
-            >
-              <option value="">All classifications</option>
-              <option value="background_context">Background</option>
-              <option value="claim_support">Claim Support</option>
-              <option value="framing_only">Framing Suggestion</option>
-              <option value="not_usable">Not Usable</option>
-            </select>
-              <svg className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-ink-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" /></svg>
+                className="text-xs bg-surface-1 border border-surface-2 rounded-lg px-2 py-1.5 text-ink focus:outline-none focus:ring-2 focus:ring-brand/50 appearance-none pr-7"
+                style={{ colorScheme: "dark" }}
+                value={usageFilter}
+                onChange={(e) => setUsageFilter(e.target.value)}
+              >
+                <option value="">All classifications</option>
+                <option value="background_context">Background</option>
+                <option value="claim_support">Claim Support</option>
+                <option value="framing_only">Framing Suggestion</option>
+                <option value="not_usable">Not Usable</option>
+              </select>
+              <svg
+                className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-ink-muted"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={2}
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
             </div>
+            {hasActiveFilter && (
+              <button
+                className="text-xs text-brand hover:underline"
+                onClick={clearFilters}
+              >
+                Clear filters
+              </button>
+            )}
           </div>
 
           {/* Findings list */}
@@ -823,12 +885,29 @@ export default function Research() {
                   />
                 </svg>
                 <p className="text-sm text-ink-muted font-medium">
-                  No findings yet
+                  {hasActiveFilter
+                    ? "No findings match this filter"
+                    : "No findings yet"}
                 </p>
                 <p className="text-xs text-ink-muted/60 mt-1 max-w-xs">
-                  Approve claims in Vault, then click{" "}
-                  <strong>Run Research</strong> to discover public context
-                  about your work.
+                  {hasActiveFilter ? (
+                    <>
+                      Try a different filter or{" "}
+                      <button
+                        className="text-brand underline"
+                        onClick={clearFilters}
+                      >
+                        clear filters
+                      </button>
+                      .
+                    </>
+                  ) : (
+                    <>
+                      Approve claims in Vault, then click{" "}
+                      <strong>Run Research</strong> to discover public context
+                      about your work.
+                    </>
+                  )}
                 </p>
               </div>
             ) : (

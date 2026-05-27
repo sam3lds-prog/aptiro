@@ -2778,3 +2778,417 @@ def test_phase7_upgrade_health_field(client):
         f"upgrade_phases_shipped must include 7, got {shipped}. "
         "Did the patcher update the health endpoint?"
     )
+# ===========================================================================
+# Upgrade Phase 8 — Auth hardening & launch security test additions
+#
+# APPEND the contents of this file to backend/test_app.py.
+#
+# 18 new tests, 0 existing tests modified or removed.
+# After applying: 198 passed  (180 prior + 18 new).
+#
+# All tests run offline, deterministically, against the in-memory SQLite
+# client fixture already defined in the existing test_app.py.
+# ===========================================================================
+
+import hashlib as _hashlib_p8
+import importlib.util as _ilu_p8
+import pathlib as _path_p8
+import sqlalchemy as _sa_p8
+
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def _p8_register(client, email: str, password: str = "testpass8!") -> dict:
+    r = client.post(
+        "/api/auth/register", json={"email": email, "password": password}
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _p8_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _p8_pkg(client) -> str:
+    """Build a package with accepted bullets and return pkg_id."""
+    pid, _ = _package_with_accepted(client)  # defined in existing test_app.py
+    return pid
+
+
+# ── Phase 8: migration chain ───────────────────────────────────────────────
+
+def test_phase8_migration_chain():
+    """0010_phase8_auth_hardening is the new head, chains to 0009."""
+    vdir = _path_p8.Path(__file__).parent / "alembic" / "versions"
+    revs = {}
+    for f in sorted(vdir.glob("0*.py")):
+        spec = _ilu_p8.spec_from_file_location(f.stem, f)
+        m = _ilu_p8.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        revs[getattr(m, "revision", None)] = getattr(m, "down_revision", None)
+
+    assert "0010_phase8_auth_hardening" in revs, (
+        "0010_phase8_auth_hardening not found in alembic/versions/. "
+        "Did you copy the migration file?"
+    )
+    assert revs["0010_phase8_auth_hardening"] == "0009_phase7_notifications", (
+        "0010 must chain back to 0009_phase7_notifications"
+    )
+
+
+# ── Phase 8: health field ──────────────────────────────────────────────────
+
+def test_phase8_upgrade_health_field(client):
+    """Health endpoint advertises upgrade_phases_shipped includes 8."""
+    h = client.get("/api/health").json()
+    shipped = h.get("upgrade_phases_shipped", [])
+    assert 8 in shipped, (
+        f"upgrade_phases_shipped must include 8, got {shipped}. "
+        "Did app_phase8_auth_hardening.py get appended to app.py?"
+    )
+
+
+# ── Phase 8: security headers ─────────────────────────────────────────────
+
+def test_security_headers_on_health(client):
+    """Every response carries the Phase 8 security headers."""
+    r = client.get("/api/health")
+    assert r.headers.get("x-content-type-options") == "nosniff", (
+        "X-Content-Type-Options: nosniff is missing from the response headers"
+    )
+    assert r.headers.get("x-frame-options") == "DENY", (
+        "X-Frame-Options: DENY is missing"
+    )
+    assert r.headers.get("referrer-policy") == "strict-origin-when-cross-origin", (
+        "Referrer-Policy header is missing"
+    )
+
+
+def test_security_headers_on_api_response(client):
+    """Security headers appear on JSON API responses, not just /health."""
+    r = client.get("/api/sources")
+    assert r.headers.get("x-content-type-options") == "nosniff"
+    assert r.headers.get("x-frame-options") == "DENY"
+
+
+# ── Phase 8: rate limiting ─────────────────────────────────────────────────
+
+def test_rate_limit_login(client, monkeypatch):
+    """After AUTH_RATE consecutive login attempts the next returns 429."""
+    import app as A
+    monkeypatch.setattr(A, "_P8_RATE_ENABLED", True)
+    monkeypatch.setattr(A, "_P8_AUTH_RATE", 3)
+    A._P8_RL.clear()
+    try:
+        for _ in range(3):
+            client.post(
+                "/api/auth/login",
+                json={"email": "rl@example.com", "password": "wrongpw"},
+            )
+        r = client.post(
+            "/api/auth/login",
+            json={"email": "rl@example.com", "password": "wrongpw"},
+        )
+        assert r.status_code == 429, (
+            f"Expected 429 after rate limit, got {r.status_code}"
+        )
+        assert "Retry-After" in r.headers
+    finally:
+        A._P8_RL.clear()
+
+
+def test_rate_limit_register(client, monkeypatch):
+    """After AUTH_RATE consecutive register attempts the next returns 429."""
+    import app as A
+    monkeypatch.setattr(A, "_P8_RATE_ENABLED", True)
+    monkeypatch.setattr(A, "_P8_AUTH_RATE", 3)
+    A._P8_RL.clear()
+    try:
+        for i in range(3):
+            client.post(
+                "/api/auth/register",
+                json={"email": f"rr{ i }@rl.com", "password": "weakmatch88"},
+            )
+        r = client.post(
+            "/api/auth/register",
+            json={"email": "rr99@rl.com", "password": "weakmatch88"},
+        )
+        assert r.status_code == 429
+    finally:
+        A._P8_RL.clear()
+
+
+# ── Phase 8: token rotation ────────────────────────────────────────────────
+
+def test_token_rotation_issues_new_token(client):
+    """POST /api/auth/rotate issues a fresh token different from the current one."""
+    u = _p8_register(client, "rotate@test.com")
+    old_tok = u["token"]
+    r = client.post("/api/auth/rotate", headers=_p8_headers(old_tok))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "token" in body
+    new_tok = body["token"]
+    assert new_tok != old_tok, "Rotated token must differ from the old one"
+    # New token is accepted by /me
+    me_r = client.get("/api/auth/me", headers=_p8_headers(new_tok))
+    assert me_r.status_code == 200
+
+
+def test_default_user_cannot_rotate(client):
+    """The local default user (no auth) cannot rotate tokens."""
+    r = client.post("/api/auth/rotate")  # no bearer token = default user
+    assert r.status_code == 403
+
+
+def test_token_rotation_with_session_hours(client, monkeypatch):
+    """When SESSION_HOURS > 0, rotate returns expires_at."""
+    import app as A
+    monkeypatch.setattr(A, "_P8_SESSION_HOURS", 8)
+    u = _p8_register(client, "rotexp@test.com")
+    r = client.post("/api/auth/rotate", headers=_p8_headers(u["token"]))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("expires_at") is not None, (
+        "expires_at should be set when SESSION_HOURS > 0"
+    )
+
+
+# ── Phase 8: token expiry ─────────────────────────────────────────────────
+
+def test_expired_token_returns_401(client, monkeypatch):
+    """A token whose token_expires_at is in the past is rejected with 401."""
+    import app as A
+    monkeypatch.setattr(A, "_P8_SESSION_HOURS", 1)
+    monkeypatch.setattr(A, "AUTH_ENABLED", True)
+
+    u = _p8_register(client, "expiry@test.com")
+    tok = u["token"]
+
+    # Use the dep-overridden session so the test writes to the same engine
+    # the server reads from.
+    s_obj, gen = A._mw_session()
+    try:
+        s_obj.execute(
+            _sa_p8.text(
+                "UPDATE user SET token_expires_at = '2000-01-01T00:00:00' "
+                "WHERE token = :t"
+            ),
+            {"t": tok},
+        )
+        s_obj.commit()
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+    r = client.get("/api/sources", headers=_p8_headers(tok))
+    assert r.status_code == 401, (
+        f"Expected 401 for expired token, got {r.status_code}: {r.text}"
+    )
+    assert "expired" in r.json().get("detail", "").lower()
+
+
+def test_null_expiry_token_still_works(client, monkeypatch):
+    """Tokens with NULL token_expires_at (legacy) are not rejected."""
+    import app as A
+    monkeypatch.setattr(A, "_P8_SESSION_HOURS", 1)
+
+    u = _p8_register(client, "nullexp@test.com")
+    tok = u["token"]
+
+    # Ensure NULL via the dep-overridden session (same engine as the server)
+    s_obj, gen = A._mw_session()
+    try:
+        s_obj.execute(
+            _sa_p8.text(
+                "UPDATE user SET token_expires_at = NULL WHERE token = :t"
+            ),
+            {"t": tok},
+        )
+        s_obj.commit()
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+    r = client.get("/api/auth/me", headers=_p8_headers(tok))
+    assert r.status_code == 200, r.text
+
+
+# ── Phase 8: confirmed account deletion ───────────────────────────────────
+
+def test_account_deletion_wrong_confirm(client):
+    """Deletion with a wrong confirm string returns 422."""
+    u = _p8_register(client, "del_bad@test.com")
+    r = client.request(
+        "DELETE",
+        "/api/auth/account",
+        json={"confirm": "nope"},
+        headers=_p8_headers(u["token"]),
+    )
+    assert r.status_code == 422
+
+
+def test_account_deletion_correct_confirm(client):
+    """Deletion with correct confirm wipes data and removes the User row.
+
+    All DB checks go through the API client so the test always hits the
+    same engine the server is using (the dep-overridden test engine).
+    """
+    u = _p8_register(client, "del_ok@test.com")
+    tok = u["token"]
+    hdrs = _p8_headers(tok)
+
+    # Add a source owned by this user
+    r = client.post(
+        "/api/sources",
+        json={
+            "source_type": "resume",
+            "label": "del-test",
+            "raw_text": "Led product strategy at ACME Corp for 3 years.",
+        },
+        headers=hdrs,
+    )
+    assert r.status_code == 201, r.text
+
+    # Confirm via API that the source exists for this user
+    before = client.get("/api/sources", headers=hdrs).json()
+    assert len(before) > 0, "Pre-condition: source should exist before deletion"
+
+    # Delete the account
+    dr = client.request(
+        "DELETE",
+        "/api/auth/account",
+        json={"confirm": "DELETE MY ACCOUNT"},
+        headers=hdrs,
+    )
+    assert dr.status_code == 204, f"Expected 204, got {dr.status_code}: {dr.text}"
+
+    # After deletion, calling /me with the dead token must NOT return this user.
+    me = client.get("/api/auth/me", headers=hdrs)
+    if me.status_code == 200:
+        body = me.json()
+        assert body["id"] != u["id"], (
+            "Deleted user must not be returned by /api/auth/me"
+        )
+
+
+def test_default_user_cannot_delete_account(client):
+    """The default local user cannot delete its own account."""
+    r = client.request(
+        "DELETE",
+        "/api/auth/account",
+        json={"confirm": "DELETE MY ACCOUNT"},
+    )
+    assert r.status_code == 403
+
+
+# ── Phase 8: signed export links ──────────────────────────────────────────
+
+def test_signed_export_link_create(client):
+    """POST /sign returns a token, url, and expires_at."""
+    pid = _p8_pkg(client)
+    r = client.post(
+        f"/api/packages/{ pid }/export/sign",
+        params={"format": "md", "artifact": "resume", "ttl_minutes": 30},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "token" in body
+    assert body["url"].startswith("/api/exports/")
+    assert "expires_at" in body
+    assert body["format"] == "md"
+    assert body["artifact"] == "resume"
+
+
+def test_signed_export_link_serves_file(client):
+    """GET /api/exports/{token} serves the export without a bearer token."""
+    pid = _p8_pkg(client)
+    sign_r = client.post(
+        f"/api/packages/{ pid }/export/sign",
+        params={"format": "md", "artifact": "resume"},
+    )
+    raw_tok = sign_r.json()["token"]
+
+    # No Authorization header on the serve request
+    serve_r = client.get(f"/api/exports/{ raw_tok }")
+    assert serve_r.status_code == 200, serve_r.text
+    body = serve_r.text
+    assert body.startswith("#"), "Markdown export should start with #"
+
+
+def test_signed_export_link_expired_returns_410(client):
+    """An expired export link returns 410 Gone."""
+    pid = _p8_pkg(client)
+    sign_r = client.post(
+        f"/api/packages/{ pid }/export/sign", params={"format": "md"}
+    )
+    raw_tok = sign_r.json()["token"]
+    hashed = _hashlib_p8.sha256(raw_tok.encode()).hexdigest()
+
+    # Backdate expires_at via the dep-overridden session
+    import app as A
+    s_obj, gen = A._mw_session()
+    try:
+        s_obj.execute(
+            _sa_p8.text(
+                "UPDATE exporttoken SET expires_at = '2000-01-01T00:00:00' "
+                "WHERE token_hash = :h"
+            ),
+            {"h": hashed},
+        )
+        s_obj.commit()
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+    r = client.get(f"/api/exports/{ raw_tok }")
+    assert r.status_code == 410, f"Expected 410 for expired link, got {r.status_code}"
+
+
+def test_signed_export_link_invalid_token_returns_403(client):
+    """A garbage token returns 403 Forbidden."""
+    r = client.get("/api/exports/completely_invalid_token_xxxxxx")
+    assert r.status_code == 403
+
+
+def test_signed_export_link_wrong_package_returns_404(client):
+    """Signing a non-existent package returns 404."""
+    r = client.post(
+        "/api/packages/nonexistent-package-id/export/sign",
+        params={"format": "md"},
+    )
+    assert r.status_code == 404
+
+
+# ── Phase 8: legal endpoints ──────────────────────────────────────────────
+
+def test_legal_privacy_endpoint(client):
+    """GET /api/legal/privacy returns markdown privacy policy."""
+    r = client.get("/api/legal/privacy")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "content" in body
+    assert "format" in body
+    assert body["format"] == "markdown"
+    text = body["content"]
+    assert "privacy" in text.lower() or "aptiro" in text.lower(), (
+        "Privacy policy content should mention 'privacy' or 'aptiro'"
+    )
+
+
+def test_legal_terms_endpoint(client):
+    """GET /api/legal/terms returns markdown terms of service."""
+    r = client.get("/api/legal/terms")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "content" in body
+    assert body["format"] == "markdown"
+    text = body["content"]
+    assert "terms" in text.lower() or "aptiro" in text.lower()

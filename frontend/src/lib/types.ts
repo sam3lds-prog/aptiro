@@ -1,216 +1,79 @@
-// Aptiro — TypeScript types modelled on FastAPI schemas.
-// Upgrade Phase 7 adds notification center types.
-
-// ── Enums ──────────────────────────────────────────────────────────────────
-export type SourceType =
-  | "resume" | "linkedin" | "portfolio"
-  | "article" | "public_article" | "manual_note" | "other";
-export type ApprovalStatus = "pending" | "approved" | "rejected" | "do_not_use";
-export type ProvenanceColor = "blue" | "purple" | "green" | "orange" | "red";
-export type WorkMode = "remote" | "onsite" | "hybrid" | "any";
-export type Aggressiveness = "conservative" | "balanced" | "opportunistic";
-export type BulletStatus = "proposed" | "accepted" | "rejected" | "rewritten" | "locked";
-export type PackageStatus = "draft" | "ready" | "exported";
-export type ApplicationStatus =
-  | "drafted" | "exported" | "submitted_by_user"
-  | "interviewing" | "offer" | "rejected" | "withdrawn";
-
-// ── Sources & Claims ───────────────────────────────────────────────────────
-export interface ParseMeta {
-  format?: string;
-  pages?: number;
-  page_map?: Record<string, unknown>;
-  [key: string]: unknown;
-}
-
-export interface Source {
-  id: string; source_type: SourceType; label: string;
-  filename?: string | null; extracted_text: string;
-  parse_meta: ParseMeta; created_at: string; claim_count: number;
-}
-export type SourceRow = Source;
-
-export interface SourceRef {
-  id: string; source_id: string; source_type: SourceType;
-  section: string; snippet: string; page?: number | null; confidence: number;
-}
-
-export interface Claim {
-  id: string; source_id: string; claim_text: string; claim_type: string;
-  company?: string | null; role?: string | null; date_range?: string | null;
-  skills: string[]; metrics: string[]; confidence: number;
-  approval_status: ApprovalStatus; user_note?: string | null;
-  provenance_category: string; provenance_color: ProvenanceColor;
-  source_refs: SourceRef[];
-}
-
-// ── Strategy ───────────────────────────────────────────────────────────────
-export interface Strategy {
-  id: string; name: string; is_active: boolean; target_roles: string[];
-  region?: string | null; work_mode: WorkMode;
-  salary_min?: number | null; salary_max?: number | null;
-  aggressiveness: Aggressiveness; weights: Record<string, number>;
-  include_companies: string[]; exclude_companies: string[];
-  targeting_notes: string; score_threshold: number; updated_at: string;
-}
-export interface StrategyListItem {
-  id: string; name: string; is_active: boolean; aggressiveness: Aggressiveness;
-  score_threshold: number; target_roles: string[]; work_mode: WorkMode; updated_at: string;
-}
-export interface StrategyPreviewCounts {
-  jobs_considered: number; above_threshold: number; strong: number;
-  moderate: number; weak: number; excluded: number;
-  avg_score: number; top_score: number; score_threshold: number;
-  threshold_passing_titles: string[];
-}
-export interface StrategyPreview {
-  strategy_id: string | null; strategy_name: string;
-  current: StrategyPreviewCounts; active: StrategyPreviewCounts | null; summary: string;
-}
-export interface StrategyUpsertBody {
-  name: string; target_roles: string[]; region?: string | null; work_mode: WorkMode;
-  salary_min?: number | null; salary_max?: number | null;
-  aggressiveness: Aggressiveness; weights: Record<string, number>;
-  include_companies: string[]; exclude_companies: string[];
-  targeting_notes: string; score_threshold: number; activate?: boolean;
-}
-export interface SeedPresetsResult {
-  created: StrategyListItem[]; skipped_existing: string[]; note: string;
-}
-
-// ── Jobs ───────────────────────────────────────────────────────────────────
-export interface Job {
-  id: string; title: string; company: string; location?: string | null;
-  work_mode: WorkMode; salary_min?: number | null; salary_max?: number | null;
-  source: string; source_url?: string | null; description_text: string;
-  requirements: string[];
-  structured_requirements: {
-    must_have?: string[]; nice_to_have?: string[];
-    min_years?: number | null; seniority_rank?: number | null;
-    skills?: string[]; domains?: string[];
-  };
-  is_archived: boolean; deduplicated: boolean;
-  posted_at?: string | null; imported_at: string;
-  provider_source?: string | null; provider_job_id?: string | null;
-  last_seen_at?: string | null; is_stale?: boolean;
-}
-export interface JobSourceInfo { id: string; mock: boolean; sample_count: number; }
-export interface JobSources { active_provider: string; available: JobSourceInfo[]; }
-
-// ── Matches ────────────────────────────────────────────────────────────────
-export interface ScoreComponent {
-  key: string; label: string; weight: number; earned: number; detail: string;
-  evidence?: { claim_id: string; snippet: string }[];
-}
-export interface SemanticSignal {
-  provider: string; similarity: number; affects_score: boolean;
-  agreement: string; note: string;
-}
-export interface Match {
-  job: Job; score: number; earned_points: number; max_points: number;
-  components: ScoreComponent[]; matched_skills: string[];
-  missing_requirements: string[]; excluded: boolean; summary: string;
-  structured_requirements?: Record<string, unknown>;
-  semantic?: SemanticSignal | null;
-}
-export type MatchFilter =
-  | "all" | "strong" | "moderate" | "stretch"
-  | "remote" | "above_target" | "new_this_week" | "missing_req" | "stale";
-
-// ── Saved Searches ─────────────────────────────────────────────────────────
-export interface SavedSearch {
-  id: string; owner_id: string; name: string; query: string;
-  provider?: string | null; min_salary?: number | null; max_salary?: number | null;
-  work_mode?: string | null; location_filter?: string | null;
-  frequency: "manual" | "daily" | "weekly";
-  last_run_at?: string | null; created_at: string; is_active: boolean;
-}
-export interface SavedSearchRunResult {
-  search_id: string; search_name: string; provider_used: string;
-  jobs_fetched: number; jobs_created: number; jobs_skipped_dupes: number;
-  last_run_at: string;
-}
-
-// ── Packages ───────────────────────────────────────────────────────────────
-export interface PackageBullet {
-  id: string; section: string; current_text: string; original_text?: string | null;
-  order_index: number; status: BulletStatus; provenance_color: ProvenanceColor;
-  provenance_label?: string; claim_id?: string | null;
-  source_snippet?: string | null; flagged?: string[];
-}
-export interface PackageDetail {
-  id: string; title: string; company: string; job_id: string;
-  score_snapshot: number; status: string; summary?: string;
-  bullets: PackageBullet[]; created_at?: string;
-}
-export interface PackageListItem {
-  id: string; title: string; company: string; score_snapshot: number; status: string;
-}
-export interface ExportPreview {
-  title: string; company: string; job_title: string; score: number;
-  summary?: string; generated_at: string; include_unsupported: boolean;
-  sections: Record<string, {
-    text: string; provenance: string; color: ProvenanceColor;
-    status: string; flagged?: string[];
-  }[]>;
-  excluded: { text: string; section: string; reasons: string[] }[];
-}
-
-// ── Applications / Tracker ─────────────────────────────────────────────────
-export interface Application {
-  id: string; package_id: string; job_title: string; company: string;
-  status: ApplicationStatus; applied_at?: string | null;
-  submitted_at?: string | null; snapshot_sha?: string | null;
-  history: { status: string; at: string; note?: string }[];
-  reminders: {
-    id: string; due_at: string; offset_days: number;
-    kind: string; message: string; done: boolean;
-  }[];
-  notes?: string;
-}
-export interface ApplySession {
-  id: string; package_id: string; job_title: string; company: string;
-  state: string; requires_handoff: boolean; note: string;
-  plan: { step: number; field: string; value: string; source: string; needs_user: boolean; note?: string }[];
-  history: { state: string; note: string; at: string }[];
-  allowed_actions: string[]; guardrails: string[]; created_at: string;
-}
-
-// ── Onboarding ─────────────────────────────────────────────────────────────
-export interface OnboardingStatus {
-  completed: number; total: number;
-  steps: { key: string; label: string; done: boolean }[];
-  next_step?: string | null;
-}
+// Aptiro TypeScript types — Phase 8 update.
+// Hand-maintained against FastAPI Pydantic schemas.
 
 // ── Auth ───────────────────────────────────────────────────────────────────
 export interface Me {
-  id: string; email: string; name: string; is_default: boolean; auth_enabled: boolean;
+  id: string;
+  email: string;
+  name: string;
+  is_default: boolean;
+  auth_enabled: boolean;
 }
-export interface AuthSuccess {
-  id: string; email: string; name: string; token: string;
+
+export interface AuthOut {
+  id: string;
+  email: string;
+  name: string;
+  token: string;
+}
+
+// Phase 8
+export interface RotateOut {
+  token: string;
+  expires_at: string | null;
+}
+
+export interface SignedExportLink {
+  token: string;
+  url: string;
+  expires_at: string;
+  format: string;
+  artifact: string;
+}
+
+export interface LegalDoc {
+  content: string;
+  format: "markdown";
+  last_updated: string;
 }
 
 // ── Health ─────────────────────────────────────────────────────────────────
 export interface Health {
-  status: string; app: string; slice?: string; phase?: number;
-  phases_shipped?: number[]; latest_phase?: number;
+  status: string;
+  app: string;
+  phase?: number;
+  phases_shipped?: number[];
+  latest_phase?: number;
   upgrade_phases_shipped?: number[];
-  ingestion_formats?: string[]; export_formats?: string[];
-  providers?: { ai?: string; embedding?: string; job?: string; search?: string; notification?: string };
+  ingestion_formats?: string[];
+  export_formats?: string[];
+  providers?: {
+    ai?: string;
+    embedding?: string;
+    job?: string;
+    search?: string;
+    notification?: string;
+  };
   auth?: { enabled: boolean };
   ai_assist?: { grounding_gate: boolean; auto_apply: boolean };
   application_tracker?: { auto_submit: boolean; immutable_snapshot: boolean };
   observability?: {
-    structured_logs: boolean; request_id: boolean;
-    audit_trail: boolean; config_validation: boolean;
+    structured_logs: boolean;
+    request_id: boolean;
+    audit_trail: boolean;
+    config_validation: boolean;
   };
 }
 
 // ── Audit ──────────────────────────────────────────────────────────────────
 export interface AuditEvent {
-  id: string; method: string; path: string; status: number;
-  duration_ms: number; at: string; request_id: string;
+  id: string;
+  method: string;
+  path: string;
+  status: number;
+  duration_ms: number;
+  at: string;
+  request_id: string;
 }
 
 // ── Notifications (legacy preview, unchanged) ──────────────────────────────
@@ -223,56 +86,324 @@ export type NotificationKind =
   | "followup_reminder";
 export type NotificationChannel = "email" | "slack" | "in_app";
 export interface NotificationPreview {
-  id: string; kind: NotificationKind; channel: NotificationChannel;
-  subject: string; body: string; package_id?: string | null;
-  status: string; created_at: string;
+  id: string;
+  kind: NotificationKind;
+  channel: NotificationChannel;
+  subject: string;
+  body: string;
+  package_id?: string;
+  at: string;
 }
 
-// ── Notifications (Upgrade Phase 7 — real center) ─────────────────────────
-export interface InAppNotification {
-  id: string; owner_id: string; kind: string;
-  subject: string; body: string; package_id: string | null;
-  is_read: boolean; created_at: string;
-}
-export interface NotifInboxOut {
-  items: InAppNotification[];
-  unread_count: number;
-}
-export interface NotificationPreference {
-  id: string; owner_id: string;
+// ── Phase 7 notifications ──────────────────────────────────────────────────
+export interface NotificationPreferences {
   in_app_enabled: boolean;
-  email_enabled: boolean; email_address: string;
-  email_daily_digest: boolean; email_weekly_digest: boolean;
-  email_match_alerts: boolean; email_followup_reminders: boolean;
+  email_enabled: boolean;
+  email_address: string;
+  email_daily_digest: boolean;
+  email_weekly_digest: boolean;
   match_alert_threshold: number;
-  sms_enabled: boolean; sms_phone: string;
-  smtp_configured: boolean; twilio_configured: boolean;
-  created_at: string; updated_at: string;
-}
-export interface SendDigestOut {
-  subject: string; in_app_id: string | null;
-  email_sent: boolean; sms_sent: boolean; top_job_count: number;
-}
-export interface SendAlertOut {
-  alerts_generated: number; above_threshold: number; threshold: number;
+  sms_enabled: boolean;
+  sms_phone: string;
+  smtp_configured: boolean;
+  twilio_configured: boolean;
 }
 
-// ── Research (Upgrade Phase 6) ─────────────────────────────────────────────
+export interface InAppNotification {
+  id: string;
+  kind: NotificationKind;
+  subject: string;
+  body: string;
+  is_read: boolean;
+  at: string;
+  package_id?: string;
+}
+
+export interface InboxResponse {
+  unread_count: number;
+  items: InAppNotification[];
+}
+
+// ── Sources ────────────────────────────────────────────────────────────────
+export type SourceType =
+  | "resume"
+  | "linkedin"
+  | "portfolio"
+  | "public_article"
+  | "manual_note";
+
+export interface Source {
+  id: string;
+  source_type: SourceType;
+  label: string;
+  url?: string;
+  raw_text?: string;
+  parse_meta?: Record<string, unknown>;
+  claim_count: number;
+  created_at: string;
+}
+
+// ── Claims ─────────────────────────────────────────────────────────────────
+export type ApprovalStatus = "pending" | "approved" | "rejected" | "do_not_use";
+export type ProvenanceColor = "blue" | "purple" | "green" | "orange" | "red";
+
+export interface SourceRef {
+  id: string;
+  source_id: string;
+  snippet: string;
+  section?: string;
+  page?: number;
+}
+
+export interface Claim {
+  id: string;
+  claim_text: string;
+  claim_type: string;
+  confidence: number;
+  provenance_color: ProvenanceColor;
+  approval_status: ApprovalStatus;
+  source_id?: string;
+  source_refs: SourceRef[];
+  has_metric: boolean;
+  metric_supported: boolean;
+  risk_flag?: string;
+  created_at: string;
+}
+
+// ── Strategy ───────────────────────────────────────────────────────────────
+export interface Strategy {
+  id: string;
+  name: string;
+  target_role: string;
+  target_industry: string;
+  target_location: string;
+  comp_min?: number;
+  comp_max?: number;
+  weights: Record<string, number>;
+  risk_tolerance: string;
+  score_threshold: number;
+  is_active: boolean;
+  created_at: string;
+}
+
+// ── Jobs ───────────────────────────────────────────────────────────────────
+export interface JobPosting {
+  id: string;
+  title: string;
+  company: string;
+  location?: string;
+  description?: string;
+  requirements: string[];
+  structured_requirements?: Record<string, unknown>;
+  salary_min?: number;
+  salary_max?: number;
+  remote?: boolean;
+  source?: string;
+  source_url?: string;
+  posted_at?: string;
+  is_archived: boolean;
+  is_stale?: boolean;
+  provider?: string;
+  external_id?: string;
+  created_at: string;
+}
+
+// ── Matches ────────────────────────────────────────────────────────────────
+export interface MatchComponent {
+  name: string;
+  score: number;
+  weight: number;
+  explanation: string;
+}
+
+export interface Match {
+  job_id: string;
+  job_title: string;
+  company: string;
+  location?: string;
+  score: number;
+  confidence: string;
+  top_reasons: string[];
+  top_risk?: string;
+  components: MatchComponent[];
+  matched_skills: string[];
+  skill_gaps: string[];
+  salary_min?: number;
+  salary_max?: number;
+  remote?: boolean;
+  source_url?: string;
+  posted_at?: string;
+  is_stale?: boolean;
+  strategy_used?: string;
+  semantic_similarity?: number;
+  semantic_label?: string;
+}
+
+// ── Packages ───────────────────────────────────────────────────────────────
+export type BulletStatus =
+  | "pending"
+  | "accepted"
+  | "rejected"
+  | "do_not_use"
+  | "locked";
+
+export interface PackageBullet {
+  id: string;
+  section: string;
+  current_text: string;
+  original_text: string;
+  status: BulletStatus;
+  provenance_color: ProvenanceColor;
+  claim_id?: string;
+  order_index: number;
+  risk_flag?: string;
+  lock_reason?: string;
+}
+
+export interface AgentCritique {
+  agent: string;
+  severity: string;
+  message: string;
+  note?: string;
+}
+
+export interface AgentRun {
+  id: string;
+  status: string;
+  ready: boolean;
+  summary: string;
+  readiness_score: number;
+  critiques: AgentCritique[];
+  steps?: number;
+  flags?: string[];
+  created_at: string;
+}
+
+export interface Package {
+  id: string;
+  title: string;
+  company: string;
+  job_id: string;
+  score_snapshot?: number;
+  summary?: string;
+  cover_letter?: string;
+  bullets: PackageBullet[];
+  latest_run?: AgentRun;
+  created_at: string;
+}
+
+export interface ExportPreviewSection {
+  section: string;
+  bullets: string[];
+}
+
+export interface ExportPreviewExcluded {
+  text: string;
+  reason: string;
+}
+
+export interface ExportPreview {
+  title: string;
+  company: string;
+  sections: ExportPreviewSection[];
+  excluded: ExportPreviewExcluded[];
+  include_unsupported: boolean;
+  generated_at: string;
+}
+
+// ── Application tracker ────────────────────────────────────────────────────
+export type ApplicationStatus =
+  | "drafted"
+  | "exported"
+  | "submitted_by_user"
+  | "interviewing"
+  | "offer"
+  | "rejected"
+  | "withdrawn";
+
+export interface ApplicationReminder {
+  id: string;
+  due_date: string;
+  label: string;
+  done: boolean;
+}
+
+export interface Application {
+  id: string;
+  package_id: string;
+  job_title: string;
+  company: string;
+  status: ApplicationStatus;
+  submitted_at?: string;
+  snapshot?: unknown;
+  snapshot_sha?: string;
+  reminders: ApplicationReminder[];
+  history: Array<{ from: string; to: string; at: string; note?: string }>;
+  created_at: string;
+  updated_at: string;
+}
+
+// ── Apply session ──────────────────────────────────────────────────────────
+export interface ApplySession {
+  id: string;
+  package_id: string;
+  state: string;
+  guardrails: string[];
+  allowed_actions: string[];
+  history: Array<{ action: string; at: string }>;
+  created_at: string;
+}
+
+// ── Saved searches ─────────────────────────────────────────────────────────
+export type SearchFrequency = "manual" | "daily" | "weekly";
+
+export interface SavedSearch {
+  id: string;
+  name: string;
+  query: string;
+  provider?: string;
+  location_filter?: string;
+  remote_only?: boolean;
+  min_salary?: number;
+  frequency: SearchFrequency;
+  last_run_at?: string;
+  created_at: string;
+}
+
+// ── Research ───────────────────────────────────────────────────────────────
 export type ResearchUsageClass =
-  | "background_context" | "claim_support" | "framing_only" | "not_usable";
-export type ResearchApprovalStatus = "pending" | "approved" | "rejected";
+  | "background_context"
+  | "claim_support"
+  | "framing_only"
+  | "not_usable";
+
+export type ResearchApprovalStatus =
+  | "pending_review"
+  | "approved"
+  | "rejected";
+
 export interface ResearchFinding {
-  id: string; owner_id: string; query: string;
-  source_url: string | null; source_title: string | null; source_snippet: string;
-  finding_text: string; usage_class: ResearchUsageClass;
-  suggested_framing: string | null; approval_status: ResearchApprovalStatus;
-  prompted_by_claim_ids: string[]; provider: string;
-  created_at: string; approved_at: string | null;
+  id: string;
+  query_used: string;
+  source_url?: string;
+  title?: string;
+  snippet: string;
+  relevance_score: number;
+  usage_class: ResearchUsageClass;
+  approval_status: ResearchApprovalStatus;
+  approved_at?: string;
+  created_at: string;
 }
-export interface ResearchQueryItem { query: string; rationale: string; claim_ids: string[]; }
-export interface GenerateQueriesOut {
-  queries: ResearchQueryItem[]; approved_claim_count: number; message: string;
-}
-export interface RunResearchOut {
-  findings_created: number; queries_used: string[]; provider: string; message: string;
+
+// ── Phase 8: Export tokens ─────────────────────────────────────────────────
+export interface ExportToken {
+  id: string;
+  owner_id: string;
+  package_id: string;
+  format: string;
+  artifact: string;
+  include_unsupported: boolean;
+  expires_at: string;
+  created_at: string;
+  used_at: string | null;
 }
