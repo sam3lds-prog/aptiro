@@ -263,17 +263,13 @@ class AuditEvent(SQLModel, table=True):
     at: datetime = Field(default_factory=_now)
 
 
-class Source(SQLModel, table=True):
-    id: str = Field(default_factory=_uuid, primary_key=True)
-    owner_id: str = Field(default=DEFAULT_UID, index=True)
-    source_type: SourceType
-    label: str
-    filename: Optional[str] = None
-    raw_text: str = ""
-    extracted_text: str = ""
-    parse_meta: dict = Field(default_factory=dict, sa_column=Column(JSON))
-    created_at: datetime = Field(default_factory=_now)
-    claims: List["ProfileClaim"] = Relationship(back_populates="source")
+# APTIRO_PHASE9_PR7_SOURCES_MARKER
+# Source, SourceRef, schemas, sources_router → modules/sources/ (PR-7)
+from app.modules.sources import (  # noqa: F401
+    Source, SourceRef,
+    SourceCreate, SourceRead, SourceRefRead,
+    sources_router, _source_read,
+)
 
 
 class ProfileClaim(SQLModel, table=True):
@@ -298,16 +294,7 @@ class ProfileClaim(SQLModel, table=True):
         sa_relationship_kwargs={"cascade": "all, delete-orphan"})
 
 
-class SourceRef(SQLModel, table=True):
-    id: str = Field(default_factory=_uuid, primary_key=True)
-    claim_id: str = Field(foreign_key="profileclaim.id", index=True)
-    source_id: str = Field(foreign_key="source.id", index=True)
-    source_type: SourceType
-    section: str = ""
-    snippet: str = ""
-    page: Optional[int] = None
-    confidence: float = 0.0
-    claim: Optional[ProfileClaim] = Relationship(back_populates="source_refs")
+# SourceRef imported from modules/sources (Phase 9 PR-7)
 
 
 DEFAULT_WEIGHTS = {
@@ -1121,32 +1108,7 @@ def import_job(description_text, source_url=None, title=None, company=None,
 # ===========================================================================
 # Schemas + Delivery 1 routers
 # ===========================================================================
-class SourceCreate(BaseModel):
-    source_type: SourceType
-    label: str
-    raw_text: str = ""
-    filename: Optional[str] = None
-
-
-class SourceRead(BaseModel):
-    id: str
-    source_type: SourceType
-    label: str
-    filename: Optional[str]
-    extracted_text: str
-    parse_meta: dict = {}
-    created_at: datetime
-    claim_count: int = 0
-
-
-class SourceRefRead(BaseModel):
-    id: str
-    source_id: str
-    source_type: SourceType
-    section: str
-    snippet: str
-    page: Optional[int] = None
-    confidence: float
+# SourceCreate/Read/RefRead imported from modules/sources (Phase 9 PR-7)
 
 
 class ClaimRead(BaseModel):
@@ -1234,115 +1196,16 @@ class JobRead(BaseModel):
     is_stale: bool = False
 
 
-sources_router = APIRouter(prefix="/api/sources", tags=["sources"])
+# sources_router imported from modules/sources (Phase 9 PR-7)
 claims_router = APIRouter(prefix="/api/claims", tags=["claims"])
 strategy_router = APIRouter(prefix="/api/strategy", tags=["strategy"])
 jobs_router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 
-def _source_read(session, s):
-    cnt = len(session.exec(
-        select(ProfileClaim).where(ProfileClaim.source_id == s.id)).all())
-    return SourceRead(
-        id=s.id, source_type=s.source_type, label=s.label,
-        filename=s.filename, extracted_text=s.extracted_text,
-        parse_meta=s.parse_meta or {}, created_at=s.created_at,
-        claim_count=cnt)
+# _source_read imported from modules/sources (Phase 9 PR-7)
 
 
-def claim_read(session, c):
-    cat = claim_provenance(session, c)
-    refs = session.exec(
-        select(SourceRef).where(SourceRef.claim_id == c.id)).all()
-    return ClaimRead(
-        id=c.id, source_id=c.source_id, claim_text=c.claim_text,
-        claim_type=c.claim_type, company=c.company, role=c.role,
-        date_range=c.date_range, skills=c.skills, metrics=c.metrics,
-        confidence=c.confidence, approval_status=c.approval_status,
-        user_note=c.user_note, provenance_category=cat,
-        provenance_color=provenance_color(cat),
-        source_refs=[SourceRefRead(
-            id=r.id, source_id=r.source_id, source_type=r.source_type,
-            section=r.section, snippet=r.snippet, page=r.page,
-            confidence=r.confidence) for r in refs])
-
-
-@sources_router.get("", response_model=List[SourceRead])
-def list_sources(session: Session = Depends(get_session)):
-    rows = session.exec(
-        select(Source).where(Source.owner_id == _uid())
-        .order_by(Source.created_at.desc())).all()
-    return [_source_read(session, s) for s in rows]
-
-
-@sources_router.post("", response_model=SourceRead, status_code=201)
-def create_source(body: SourceCreate,
-                   session: Session = Depends(get_session)):
-    src = Source(source_type=body.source_type, label=body.label,
-                 filename=body.filename, raw_text=body.raw_text,
-                 extracted_text=body.raw_text, owner_id=_uid(),
-                 parse_meta={"format": "text", "chars": len(body.raw_text)})
-    session.add(src)
-    session.commit()
-    session.refresh(src)
-    extract_claims(session, src)
-    return _source_read(session, src)
-
-
-@sources_router.post("/upload", response_model=SourceRead,
-                     status_code=201)
-async def upload_source(
-        file: UploadFile = File(...),
-        source_type: SourceType = Query(SourceType.resume),
-        session: Session = Depends(get_session)):
-    """Production ingestion: PDF / DOCX / TXT / Markdown.
-
-    Real extraction lives in ingestion.py; provenance, snippets,
-    sections, confidence and the approval gate are unchanged because the
-    extracted text flows through the SAME parse_document/extract_claims
-    pipeline.
-    """
-    data = await file.read()
-    if len(data) > ingestion.MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            413, "File exceeds the %d MB upload limit."
-            % (ingestion.MAX_UPLOAD_BYTES // (1024 * 1024)))
-    try:
-        result = ingestion.extract(file.filename or "upload", data)
-    except ingestion.UnsupportedFormat as e:
-        raise HTTPException(415, str(e))
-    except ingestion.ExtractionError as e:
-        raise HTTPException(422, str(e))
-    if not result.text.strip():
-        raise HTTPException(
-            422, "No extractable text found (the file may be a scanned "
-                 "image; OCR is out of scope for this slice).")
-    src = Source(
-        source_type=source_type, label=file.filename or "Uploaded",
-        filename=file.filename, raw_text=result.text, owner_id=_uid(),
-        extracted_text=result.text, parse_meta=result.meta)
-    session.add(src)
-    session.commit()
-    session.refresh(src)
-    extract_claims(session, src)
-    return _source_read(session, src)
-
-
-@sources_router.delete("/{source_id}", status_code=204)
-def delete_source(source_id: str,
-                  session: Session = Depends(get_session)):
-    src = session.get(Source, source_id)
-    if not src:
-        raise HTTPException(404, "Source not found")
-    for c in session.exec(select(ProfileClaim).where(
-            ProfileClaim.source_id == source_id)).all():
-        for r in session.exec(select(SourceRef).where(
-                SourceRef.claim_id == c.id)).all():
-            session.delete(r)
-        session.delete(c)
-    session.delete(src)
-    session.commit()
-
+# source endpoints imported from modules/sources (Phase 9 PR-7)
 
 @claims_router.get("", response_model=List[ClaimRead])
 def list_claims(source_id: Optional[str] = None,
