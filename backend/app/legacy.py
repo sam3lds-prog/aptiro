@@ -93,15 +93,18 @@ _URL_FETCH_DENY = {
     "glassdoor.com", "www.glassdoor.com", "facebook.com",
     "www.facebook.com", "x.com", "twitter.com",
 }
-_IS_SQLITE = DATABASE_URL.startswith("sqlite")
+# APTIRO_PHASE9_PR5_DB_MARKER
+# _now, _IS_SQLITE, engine, get_session extracted to db/engine.py (Phase 9 PR-5)
+from app.db.engine import (  # noqa: F401
+    _now, _IS_SQLITE, engine, get_session,
+)
 
 
 def _uuid():
     return uuid.uuid4().hex
 
 
-def _now():
-    return datetime.now(timezone.utc)
+# _now imported from app.db.engine (Phase 9 PR-5)
 
 
 # ===========================================================================
@@ -494,9 +497,8 @@ class Application(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_now)
 
 
-_connect_args = {"check_same_thread": False} if _IS_SQLITE else {}
-engine = create_engine(DATABASE_URL, echo=False,
-                       connect_args=_connect_args)
+# _connect_args defined in app.db.engine (Phase 9 PR-5)
+# engine imported from app.db.engine (Phase 9 PR-5)
 
 
 def _ensure_additive_columns():
@@ -594,9 +596,7 @@ def init_db():
     _ensure_default_user()
 
 
-def get_session():
-    with Session(engine) as s:
-        yield s
+# get_session imported from app.db.engine (Phase 9 PR-5)
 
 
 # --- Phase 4: auth + scoping helpers -------------------------------------
