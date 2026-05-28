@@ -1207,6 +1207,28 @@ jobs_router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 # source endpoints imported from modules/sources (Phase 9 PR-7)
 
+def claim_read(session, c):
+    """Build ClaimRead DTO for a ProfileClaim, with provenance + refs.
+
+    Restored after Phase 9 PR-7 accidentally removed it while
+    extracting modules/sources. Verbatim behavior to pre-PR-7.
+    """
+    cat = claim_provenance(session, c)
+    refs = session.exec(
+        select(SourceRef).where(SourceRef.claim_id == c.id)).all()
+    return ClaimRead(
+        id=c.id, source_id=c.source_id, claim_text=c.claim_text,
+        claim_type=c.claim_type, company=c.company, role=c.role,
+        date_range=c.date_range, skills=c.skills, metrics=c.metrics,
+        confidence=c.confidence, approval_status=c.approval_status,
+        user_note=c.user_note, provenance_category=cat,
+        provenance_color=provenance_color(cat),
+        source_refs=[SourceRefRead(
+            id=r.id, source_id=r.source_id, source_type=r.source_type,
+            section=r.section, snippet=r.snippet, page=r.page,
+            confidence=r.confidence) for r in refs])
+
+
 @claims_router.get("", response_model=List[ClaimRead])
 def list_claims(source_id: Optional[str] = None,
                 session: Session = Depends(get_session)):
