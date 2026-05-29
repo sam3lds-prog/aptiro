@@ -117,36 +117,24 @@ class SourceType(str, Enum):
     public_url = "public_url"
 
 
-class ClaimType(str, Enum):
-    achievement = "achievement"
-    responsibility = "responsibility"
-    skill = "skill"
-    education = "education"
-    summary = "summary"
-
-
-class ApprovalStatus(str, Enum):
-    pending = "pending"
-    approved = "approved"
-    rejected = "rejected"
-    do_not_use = "do_not_use"
-
-
-class ProvenanceCategory(str, Enum):
-    grounded_resume_truth = "grounded_resume_truth"
-    profile_derived = "profile_derived"
-    public_context_supported = "public_context_supported"
-    ai_suggested = "ai_suggested"
-    unsupported = "unsupported"
-
-
-PROVENANCE_COLOR = {
-    ProvenanceCategory.grounded_resume_truth: "blue",
-    ProvenanceCategory.profile_derived: "purple",
-    ProvenanceCategory.public_context_supported: "green",
-    ProvenanceCategory.ai_suggested: "orange",
-    ProvenanceCategory.unsupported: "red",
-}
+# APTIRO_PHASE9_PR8_PROFILE_TRUTH_MARKER
+# Claim domain → modules/profile_truth/ (Phase 9 PR-8):
+#   Enums:    ClaimType, ApprovalStatus, ProvenanceCategory
+#   Mapping:  PROVENANCE_COLOR
+#   Model:    ProfileClaim
+#   Schemas:  ClaimRead, ClaimUpdate
+#   Helpers:  provenance_for_source, provenance_color,
+#             claim_provenance, claim_read
+#   Router:   claims_router (list, get, patch endpoints)
+from app.modules.profile_truth import (  # noqa: F401
+    ClaimType, ApprovalStatus, ProvenanceCategory,
+    PROVENANCE_COLOR,
+    ProfileClaim,
+    ClaimRead, ClaimUpdate,
+    provenance_for_source, provenance_color,
+    claim_provenance, claim_read,
+    claims_router,
+)
 
 
 class WorkMode(str, Enum):
@@ -270,28 +258,6 @@ from app.modules.sources import (  # noqa: F401
     SourceCreate, SourceRead, SourceRefRead,
     sources_router, _source_read,
 )
-
-
-class ProfileClaim(SQLModel, table=True):
-    id: str = Field(default_factory=_uuid, primary_key=True)
-    owner_id: str = Field(default=DEFAULT_UID, index=True)
-    source_id: str = Field(foreign_key="source.id", index=True)
-    claim_text: str
-    claim_type: ClaimType = ClaimType.achievement
-    company: Optional[str] = None
-    role: Optional[str] = None
-    date_range: Optional[str] = None
-    skills: List[str] = Field(default_factory=list, sa_column=Column(JSON))
-    metrics: List[str] = Field(default_factory=list, sa_column=Column(JSON))
-    confidence: float = 0.0
-    approval_status: ApprovalStatus = ApprovalStatus.pending
-    user_note: Optional[str] = None
-    created_at: datetime = Field(default_factory=_now)
-    updated_at: datetime = Field(default_factory=_now)
-    source: Optional[Source] = Relationship(back_populates="claims")
-    source_refs: List["SourceRef"] = Relationship(
-        back_populates="claim",
-        sa_relationship_kwargs={"cascade": "all, delete-orphan"})
 
 
 # SourceRef imported from modules/sources (Phase 9 PR-7)
@@ -759,20 +725,6 @@ def _claim_type(line, metrics):
     return ClaimType.achievement if metrics else ClaimType.responsibility
 
 
-def provenance_for_source(source_type):
-    if source_type == SourceType.resume:
-        return ProvenanceCategory.grounded_resume_truth
-    if source_type in (SourceType.linkedin, SourceType.profile_text):
-        return ProvenanceCategory.profile_derived
-    if source_type == SourceType.public_url:
-        return ProvenanceCategory.public_context_supported
-    return ProvenanceCategory.unsupported
-
-
-def provenance_color(category):
-    return PROVENANCE_COLOR[category]
-
-
 def _confidence(line, metrics, skills):
     score = 0.55
     if metrics:
@@ -820,16 +772,6 @@ def extract_claims(session, source):
     for c in created:
         session.refresh(c)
     return created
-
-
-def claim_provenance(session, claim):
-    if claim.approval_status in (ApprovalStatus.rejected,
-                                 ApprovalStatus.do_not_use):
-        return ProvenanceCategory.unsupported
-    src = session.get(Source, claim.source_id)
-    if src is None:
-        return ProvenanceCategory.unsupported
-    return provenance_for_source(src.source_type)
 
 
 # ===========================================================================
@@ -1111,32 +1053,6 @@ def import_job(description_text, source_url=None, title=None, company=None,
 # SourceCreate/Read/RefRead imported from modules/sources (Phase 9 PR-7)
 
 
-class ClaimRead(BaseModel):
-    id: str
-    source_id: str
-    claim_text: str
-    claim_type: ClaimType
-    company: Optional[str]
-    role: Optional[str]
-    date_range: Optional[str]
-    skills: List[str]
-    metrics: List[str]
-    confidence: float
-    approval_status: ApprovalStatus
-    user_note: Optional[str]
-    provenance_category: ProvenanceCategory
-    provenance_color: str
-    source_refs: List[SourceRefRead]
-
-
-class ClaimUpdate(BaseModel):
-    claim_text: Optional[str] = None
-    approval_status: Optional[ApprovalStatus] = None
-    user_note: Optional[str] = None
-    skills: Optional[List[str]] = None
-    metrics: Optional[List[str]] = None
-
-
 class StrategyUpsert(BaseModel):
     name: str = "Default Strategy"
     target_roles: List[str] = []
@@ -1197,7 +1113,6 @@ class JobRead(BaseModel):
 
 
 # sources_router imported from modules/sources (Phase 9 PR-7)
-claims_router = APIRouter(prefix="/api/claims", tags=["claims"])
 strategy_router = APIRouter(prefix="/api/strategy", tags=["strategy"])
 jobs_router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
@@ -1206,69 +1121,6 @@ jobs_router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 
 # source endpoints imported from modules/sources (Phase 9 PR-7)
-
-def claim_read(session, c):
-    """Build ClaimRead DTO for a ProfileClaim, with provenance + refs.
-
-    Restored after Phase 9 PR-7 accidentally removed it while
-    extracting modules/sources. Verbatim behavior to pre-PR-7.
-    """
-    cat = claim_provenance(session, c)
-    refs = session.exec(
-        select(SourceRef).where(SourceRef.claim_id == c.id)).all()
-    return ClaimRead(
-        id=c.id, source_id=c.source_id, claim_text=c.claim_text,
-        claim_type=c.claim_type, company=c.company, role=c.role,
-        date_range=c.date_range, skills=c.skills, metrics=c.metrics,
-        confidence=c.confidence, approval_status=c.approval_status,
-        user_note=c.user_note, provenance_category=cat,
-        provenance_color=provenance_color(cat),
-        source_refs=[SourceRefRead(
-            id=r.id, source_id=r.source_id, source_type=r.source_type,
-            section=r.section, snippet=r.snippet, page=r.page,
-            confidence=r.confidence) for r in refs])
-
-
-@claims_router.get("", response_model=List[ClaimRead])
-def list_claims(source_id: Optional[str] = None,
-                session: Session = Depends(get_session)):
-    q = select(ProfileClaim).where(ProfileClaim.owner_id == _uid())
-    if source_id:
-        q = q.where(ProfileClaim.source_id == source_id)
-    rows = session.exec(q.order_by(ProfileClaim.created_at)).all()
-    return [claim_read(session, c) for c in rows]
-
-
-@claims_router.get("/{claim_id}", response_model=ClaimRead)
-def get_claim(claim_id: str, session: Session = Depends(get_session)):
-    c = session.get(ProfileClaim, claim_id)
-    if not c:
-        raise HTTPException(404, "Claim not found")
-    return claim_read(session, c)
-
-
-@claims_router.patch("/{claim_id}", response_model=ClaimRead)
-def update_claim(claim_id: str, body: ClaimUpdate,
-                 session: Session = Depends(get_session)):
-    c = session.get(ProfileClaim, claim_id)
-    if not c:
-        raise HTTPException(404, "Claim not found")
-    if body.claim_text is not None:
-        c.claim_text = body.claim_text
-    if body.approval_status is not None:
-        c.approval_status = body.approval_status
-    if body.user_note is not None:
-        c.user_note = body.user_note
-    if body.skills is not None:
-        c.skills = body.skills
-    if body.metrics is not None:
-        c.metrics = body.metrics
-    c.updated_at = _now()
-    session.add(c)
-    session.commit()
-    session.refresh(c)
-    return claim_read(session, c)
-
 
 def _active_strategy(session):
     strat = session.exec(select(Strategy).where(
