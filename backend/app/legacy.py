@@ -2015,72 +2015,14 @@ class RunListItem(BaseModel):
     created_at: datetime
 
 
-packages_router = APIRouter(prefix="/api/packages", tags=["packages"])
-runs_router = APIRouter(tags=["runs"])
 
 
-@packages_router.get("", response_model=List[PackageOut])
-def list_packages(session: Session = Depends(get_session)):
-    rows = session.exec(select(ApplicationPackage).where(
-        ApplicationPackage.owner_id == _uid()).order_by(
-        ApplicationPackage.created_at.desc())).all()
-    return [_package_out(session, p) for p in rows]
 
 
-@packages_router.post("", response_model=PackageOut, status_code=201)
-def create_package(body: PackageCreate,
-                   session: Session = Depends(get_session)):
-    job = _get_owned(session, JobPosting, body.job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
-    pkg = build_package(session, job, _active_strategy(session))
-    return _package_out(session, pkg)
 
 
-@packages_router.get("/{pkg_id}", response_model=PackageOut)
-def get_package(pkg_id: str, session: Session = Depends(get_session)):
-    pkg = _get_owned(session, ApplicationPackage, pkg_id)
-    if not pkg:
-        raise HTTPException(404, "Package not found")
-    return _package_out(session, pkg)
 
 
-@packages_router.patch("/{pkg_id}/bullets/{bid}",
-                       response_model=BulletOut)
-def patch_bullet(pkg_id: str, bid: str, body: BulletPatch,
-                 session: Session = Depends(get_session)):
-    pkg = session.get(ApplicationPackage, pkg_id)
-    if not pkg:
-        raise HTTPException(404, "Package not found")
-    b = session.get(PackageBullet, bid)
-    if not b or b.package_id != pkg_id:
-        raise HTTPException(404, "Bullet not found")
-    if body.user_note is not None:
-        b.user_note = body.user_note
-    if body.current_text is not None and \
-            body.current_text != b.current_text:
-        b.current_text = body.current_text
-        if b.status not in (BulletStatus.locked,):
-            b.status = BulletStatus.rewritten
-    if body.status is not None:
-        if body.status == BulletStatus.accepted:
-            live = _bullet_live_provenance(session, b)
-            if live == ProvenanceCategory.unsupported:
-                raise HTTPException(
-                    409, "Cannot accept a bullet with no approved "
-                         "backing. Approve the source claim or rewrite "
-                         "this bullet.")
-        b.status = body.status
-    b.updated_at = _now()
-    session.add(b)
-    session.commit()
-    session.refresh(b)
-    pkg = session.get(ApplicationPackage, pkg_id)
-    if any(x.section == "cover_letter" for x in pkg.bullets):
-        _recompute_cover_letter(session, pkg)
-        session.commit()
-    session.refresh(b)
-    return _bullet_out(session, b)
 
 
 # ---- Phase 5: grounded AI assist ----------------------------------------
@@ -2112,55 +2054,6 @@ class AIRewriteOut(BaseModel):
                  "claim is blocked and never stored.")
 
 
-@packages_router.post("/{pkg_id}/bullets/{bid}/ai-rewrite",
-                      response_model=AIRewriteOut)
-def ai_rewrite_bullet(pkg_id: str, bid: str, body: AIRewriteRequest,
-                      session: Session = Depends(get_session)):
-    pkg = _get_owned(session, ApplicationPackage, pkg_id)
-    if not pkg:
-        raise HTTPException(404, "Package not found")
-    b = session.get(PackageBullet, bid)
-    if not b or b.package_id != pkg_id:
-        raise HTTPException(404, "Bullet not found")
-    if b.status == BulletStatus.locked:
-        raise HTTPException(409, "Bullet is locked.")
-    claim = session.get(ProfileClaim, b.claim_id) if b.claim_id else None
-    src = _grounding_text(session, claim)
-    sys = ("You are a careful resume editor. Rewrite the bullet to be "
-           "crisp and outcome-led, but you may ONLY use facts present "
-           "in the EVIDENCE. Do not introduce any company, product, "
-           "metric, number, title, or date that is not in the EVIDENCE. "
-           "Return only the rewritten bullet, one line.")
-    prompt = ("EVIDENCE:\n%s\n\nCURRENT BULLET:\n%s\n\n%s\nRewrite:"
-              % (src or "(none)", b.current_text or "",
-                 (body.instruction or "").strip()))
-    try:
-        prov = _ai_provider()
-        suggestion = (prov.complete(prompt, system=sys,
-                                    max_tokens=300) or "").strip()
-    except Exception as e:
-        raise HTTPException(
-            502, "AI provider error (%s); no change made."
-            % type(e).__name__)
-    violations = verify_grounded(session, suggestion, claim)
-    grounded = not violations
-    applied = False
-    if body.apply and grounded and suggestion:
-        b.original_text = b.original_text or b.current_text
-        b.current_text = suggestion
-        if b.status != BulletStatus.locked:
-            b.status = BulletStatus.rewritten
-        b.updated_at = _now()
-        session.add(b)
-        session.commit()
-        if any(x.section == "cover_letter" for x in pkg.bullets):
-            _recompute_cover_letter(session, pkg)
-            session.commit()
-        applied = True
-    return AIRewriteOut(
-        provider=prov.name, suggestion=suggestion, grounded=grounded,
-        violations=violations, applied=applied,
-        original_text=b.original_text or b.current_text)
 
 
 class AICoverLetterOut(BaseModel):
@@ -2174,65 +2067,6 @@ class AICoverLetterOut(BaseModel):
                  "saved to the package.")
 
 
-@packages_router.post("/{pkg_id}/ai-cover-letter",
-                      response_model=AICoverLetterOut)
-def ai_cover_letter(pkg_id: str, apply: bool = False,
-                    session: Session = Depends(get_session)):
-    pkg = _get_owned(session, ApplicationPackage, pkg_id)
-    if not pkg:
-        raise HTTPException(404, "Package not found")
-    accepted = [b for b in pkg.bullets
-                if b.section in ("experience", "summary", "skills")
-                and b.status in (BulletStatus.accepted,
-                                 BulletStatus.locked)]
-    if not accepted:
-        raise HTTPException(
-            409, "No accepted bullets to ground a cover letter on. "
-            "Accept some evidence-backed bullets first.")
-    facts = "\n".join("- " + (b.current_text or "") for b in accepted)
-    sys = ("You are a careful cover-letter writer. Use ONLY the facts "
-           "in EVIDENCE. Do not introduce any company, product, metric, "
-           "number, title, or date not present in EVIDENCE. 120 words "
-           "max, professional, no placeholders.")
-    prompt = ("ROLE: %s at %s\n\nEVIDENCE (accepted, evidence-backed "
-              "bullets):\n%s\n\nWrite the cover letter body:"
-              % (pkg.title or "the role", pkg.company or "the company",
-                 facts))
-    try:
-        prov = _ai_provider()
-        draft = (prov.complete(prompt, system=sys,
-                               max_tokens=400) or "").strip()
-    except Exception as e:
-        raise HTTPException(
-            502, "AI provider error (%s); no change made."
-            % type(e).__name__)
-    # Gate the draft against the UNION of the accepted bullets' claims.
-    src_terms = []
-    for b in accepted:
-        c = session.get(ProfileClaim, b.claim_id) if b.claim_id else None
-        src_terms.append(_grounding_text(session, c))
-        src_terms.append((b.current_text or "").lower())
-    union = " ".join(src_terms)
-
-    class _Syn:
-        claim_text = union
-        metrics = []
-        skills = []
-        company = pkg.company or ""
-        role = pkg.title or ""
-        date_range = ""
-    violations = verify_grounded(session, draft, _Syn())
-    grounded = not violations
-    applied = False
-    if apply and grounded and draft:
-        pkg.cover_letter = draft
-        pkg.updated_at = _now()
-        session.add(pkg)
-        session.commit()
-        applied = True
-    return AICoverLetterOut(
-        provider=prov.name, draft=draft, grounded=grounded,
-        violations=violations, applied=applied)
 
 
 # ---- council --------------------------------------------------------------
@@ -2507,27 +2341,8 @@ def _run_out(session, run):
         started_at=run.started_at, finished_at=run.finished_at)
 
 
-@packages_router.post("/{pkg_id}/orchestrate", response_model=RunOut,
-                      status_code=201)
-def run_orchestrator(pkg_id: str,
-                     session: Session = Depends(get_session)):
-    pkg = session.get(ApplicationPackage, pkg_id)
-    if not pkg:
-        raise HTTPException(404, "Package not found")
-    run = orchestrate_package(session, pkg)
-    return _run_out(session, run)
 
 
-@packages_router.get("/{pkg_id}/runs", response_model=List[RunListItem])
-def list_runs(pkg_id: str, session: Session = Depends(get_session)):
-    pkg = session.get(ApplicationPackage, pkg_id)
-    if not pkg:
-        raise HTTPException(404, "Package not found")
-    rs = sorted(pkg.runs, key=lambda r: r.started_at, reverse=True)
-    return [RunListItem(
-        id=r.id, status=r.status, ready=r.ready, summary=r.summary,
-        critique_count=len(r.critiques), created_at=r.started_at)
-        for r in rs]
 
 
 class CouncilNarrativeOut(BaseModel):
@@ -2539,42 +2354,8 @@ class CouncilNarrativeOut(BaseModel):
                  "readiness decision, or any bullet.")
 
 
-@packages_router.post("/{pkg_id}/ai-council-narrative",
-                      response_model=CouncilNarrativeOut)
-def ai_council_narrative(pkg_id: str,
-                         session: Session = Depends(get_session)):
-    pkg = _get_owned(session, ApplicationPackage, pkg_id)
-    if not pkg:
-        raise HTTPException(404, "Package not found")
-    runs = sorted(pkg.runs, key=lambda r: r.started_at, reverse=True)
-    if not runs:
-        raise HTTPException(
-            409, "Run the council first (orchestrate the package).")
-    run = runs[0]
-    lines = ["%s/%s: %s" % (c.agent, c.severity, c.message)
-             for c in run.critiques]
-    sys = ("Summarize this resume-package review for the candidate in "
-           "2-3 plain sentences. Summarize ONLY the findings listed; do "
-           "not invent issues, metrics, or praise not in the list.")
-    prompt = ("READY: %s\nFINDINGS:\n%s\n\nSummary:"
-              % (run.ready, "\n".join(lines) or "(no critiques)"))
-    try:
-        prov = _ai_provider()
-        narrative = (prov.complete(prompt, system=sys,
-                                   max_tokens=250) or "").strip()
-    except Exception as e:
-        raise HTTPException(
-            502, "AI provider error (%s)." % type(e).__name__)
-    return CouncilNarrativeOut(provider=prov.name, narrative=narrative,
-                               ready=run.ready)
 
 
-@runs_router.get("/api/runs/{run_id}", response_model=RunOut)
-def get_run(run_id: str, session: Session = Depends(get_session)):
-    run = session.get(AgentRun, run_id)
-    if not run:
-        raise HTTPException(404, "Run not found")
-    return _run_out(session, run)
 
 
 def seed_packages():
@@ -2657,56 +2438,29 @@ class ExportRequest(BaseModel):
     include_unsupported: bool = False
 
 
-@packages_router.get("/{pkg_id}/export/preview")
-def export_preview(pkg_id: str, include_unsupported: bool = False,
-                   session: Session = Depends(get_session)):
-    pkg = session.get(ApplicationPackage, pkg_id)
-    if not pkg:
-        raise HTTPException(404, "Package not found")
-    return _export_model(session, pkg, include_unsupported)
 
 
-@packages_router.get("/{pkg_id}/export")
-def export_package(pkg_id: str,
-                   format: str = Query("md"),
-                   artifact: str = Query("resume"),
-                   include_unsupported: bool = Query(False),
-                   session: Session = Depends(get_session)):
-    pkg = session.get(ApplicationPackage, pkg_id)
-    if not pkg:
-        raise HTTPException(404, "Package not found")
-    if artifact not in ("resume", "cover_letter", "both"):
-        raise HTTPException(400, "artifact must be resume|cover_letter|both")
-    model = _export_model(session, pkg, include_unsupported)
-    if format == exporting.ATS_PROFILE:
-        content, ext = exporting.render_ats(model, artifact)
-        safe = re.sub(r"[^A-Za-z0-9]+", "_",
-                      "%s_%s_ats" % (pkg.company or "aptiro",
-                                     artifact)).strip("_")
-        return Response(
-            content=content, media_type="text/plain; charset=us-ascii",
-            headers={"Content-Disposition":
-                     'attachment; filename="%s.%s"'
-                     % (safe or "aptiro_package", ext)})
-    if format not in exporting.FORMATS:
-        raise HTTPException(
-            400, "Unsupported format. Choose one of: %s (or 'ats')"
-            % ", ".join(exporting.FORMATS))
-    try:
-        content, ext = exporting.render(model, format, artifact)
-    except exporting.ExportUnavailable as e:
-        raise HTTPException(501, str(e))
-    safe = re.sub(r"[^A-Za-z0-9]+", "_",
-                  "%s_%s" % (pkg.company or "aptiro", artifact)).strip("_")
-    fname = "%s.%s" % (safe or "aptiro_package", ext)
-    return Response(
-        content=content, media_type=EXPORT_MEDIA.get(ext,
-                                                     "application/octet-stream"),
-        headers={"Content-Disposition": 'attachment; filename="%s"' % fname})
 
 
 # All package routes (CRUD, bullets, orchestrate, export) are now defined;
 # safe to register the routers.
+# APTIRO_PHASE9_PR12_PACKAGES_MARKER: packages/runs HTTP layer now lives in app.modules.packages; re-exported here for back-compat.
+from app.modules.packages import (  # noqa: E402,F401
+    ai_council_narrative,
+    ai_cover_letter,
+    ai_rewrite_bullet,
+    create_package,
+    export_package,
+    export_preview,
+    get_package,
+    get_run,
+    list_packages,
+    list_runs,
+    packages_router,
+    patch_bullet,
+    run_orchestrator,
+    runs_router,
+)
 app.include_router(packages_router)
 app.include_router(runs_router)
 
