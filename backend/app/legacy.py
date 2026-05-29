@@ -5590,3 +5590,25 @@ def _p8r4_delete_account(
     session.commit()
     return Response(status_code=204)
 
+
+
+# >>> APTIRO PHASE 11 REAL PROVIDERS (appended) >>>
+# APTIRO_PHASE11_REAL_PROVIDERS_MARKER - idempotency guard; do not remove.
+# Live multi-board providers (Greenhouse/Lever/Ashby/Adzuna). Additive:
+# falls back to the original fetch (mock + Remotive) when a provider is
+# unconfigured or errors. In-module callers resolve the name at call time,
+# so they use the live path automatically once tokens/keys are set.
+import app.modules.jobs.real_providers as _p11_real_providers
+_p11_orig_fetch_jobs_from_source = fetch_jobs_from_source
+
+
+def fetch_jobs_from_source(provider, query, limit):  # noqa: F811
+    try:
+        _p11_real = _p11_real_providers.fetch_real(provider, query,
+                                                   limit or 20)
+    except Exception:
+        _p11_real = []
+    if _p11_real:
+        return provider, _p11_real
+    return _p11_orig_fetch_jobs_from_source(provider, query, limit)
+# <<< APTIRO PHASE 11 REAL PROVIDERS <<<
