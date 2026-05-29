@@ -22,3 +22,5 @@ aptiro.db
 # Build
 build/
 dist/
+cleanup_aptiro_repo.sh
+frontend_types_partial_fix.patch
